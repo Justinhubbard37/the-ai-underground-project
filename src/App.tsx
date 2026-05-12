@@ -353,7 +353,7 @@ function ArtifactPane({
   isLoading: boolean;
   onMouseUp: () => void;
 }) {
-  const markup = useMemo(() => renderArtifactMarkup(artifact), [artifact]);
+  const renderedArtifact = useMemo(() => renderArtifactMarkup(artifact), [artifact]);
 
   return (
     <aside className="relative z-10 flex h-full w-1/4 flex-col overflow-hidden rounded-3xl border border-white/[0.05] bg-white/[0.02] shadow-2xl backdrop-blur-2xl">
@@ -366,7 +366,9 @@ function ArtifactPane({
         {isLoading ? (
           <ResearchSkeleton activeStep={activeStep ?? 'Waiting for cloud task status.'} />
         ) : artifact ? (
-          <div className="artifact-markup animate-[fadeSlideUp_0.6s_cubic-bezier(0.16,1,0.3,1)_forwards]" dangerouslySetInnerHTML={{ __html: markup }} />
+          <div className="artifact-markup animate-[fadeSlideUp_0.6s_cubic-bezier(0.16,1,0.3,1)_forwards]">
+            {renderedArtifact}
+          </div>
         ) : (
           <DefaultArtifact />
         )}
@@ -424,29 +426,58 @@ function DefaultArtifact() {
   );
 }
 
-function renderArtifactMarkup(input: string): string {
-  if (/<[a-z][\s\S]*>/i.test(input.trim())) {
-    return input;
-  }
-
-  const escaped = escapeHtml(input);
-  return escaped
-    .replace(/^### (.*)$/gm, '<h3>$1</h3>')
-    .replace(/^## (.*)$/gm, '<h2>$1</h2>')
-    .replace(/^# (.*)$/gm, '<h1>$1</h1>')
-    .replace(/`([^`]+)`/g, '<code>$1</code>')
-    .split(/\n{2,}/)
-    .map((block) => (block.startsWith('<h') ? block : `<p>${block.replace(/\n/g, '<br />')}</p>`))
-    .join('');
+function renderArtifactMarkup(input: string): JSX.Element[] {
+  return input
+    .trim()
+    .split(/\n\s*\n/)
+    .filter((block) => block.trim().length > 0)
+    .map((block, index) => renderArtifactBlock(block, index));
 }
 
-function escapeHtml(input: string): string {
-  return input
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;');
+function renderArtifactBlock(block: string, index: number): JSX.Element {
+  const trimmed = block.trim();
+  const heading = /^(#{1,3})\s+(.+)$/.exec(trimmed);
+
+  if (heading) {
+    const [, marker, text] = heading;
+    const children = renderInlineCode(text);
+
+    if (marker === '#') {
+      return <h1 key={index}>{children}</h1>;
+    }
+
+    if (marker === '##') {
+      return <h2 key={index}>{children}</h2>;
+    }
+
+    return <h3 key={index}>{children}</h3>;
+  }
+
+  const lines = block.split(/\r?\n/);
+  return (
+    <p key={index}>
+      {lines.map((line, lineIndex) => (
+        <span key={lineIndex}>
+          {lineIndex > 0 && <br />}
+          {renderInlineCode(line)}
+        </span>
+      ))}
+    </p>
+  );
+}
+
+function renderInlineCode(text: string): Array<string | JSX.Element> {
+  const parts = text.split(/(`[^`]+`)/g);
+
+  return parts
+    .filter((part) => part.length > 0)
+    .map((part, index) => {
+      if (part.startsWith('`') && part.endsWith('`') && part.length > 1) {
+        return <code key={index}>{part.slice(1, -1)}</code>;
+      }
+
+      return part;
+    });
 }
 
 function queueStatusClass(status: string): string {
