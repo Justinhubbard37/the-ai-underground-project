@@ -1,0 +1,13 @@
+node_modules/
+dist/
+.npm-cache/
+src-tauri/target/
+src-tauri/gen/
+src-tauri/tauri.conf.json
+src-tauri/capabilities/
+.git/
+*.zip
+AI_PROJECT_TREE.txt
+the-ai-underground-project-ui.txt
+package-lock.json
+src-tauri/Cargo.lock

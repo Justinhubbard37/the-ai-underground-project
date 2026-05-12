@@ -74,9 +74,7 @@ export const useUndergroundStore = create<UndergroundState>((set) => ({
           ...message,
           content: message.content + contentDelta,
           thinking_content:
-            thinkingDelta.length > 0
-              ? `${message.thinking_content ?? ''}${thinkingDelta}`
-              : message.thinking_content,
+            thinkingDelta.length > 0 ? `${message.thinking_content ?? ''}${thinkingDelta}` : message.thinking_content,
         };
       }),
     })),
@@ -140,8 +138,8 @@ export const useUndergroundStore = create<UndergroundState>((set) => ({
             thinking_content: thoughtSummary ?? update.active_step,
             content:
               update.status === 'completed'
-                ? update.artifact ?? 'Deep Research completed without an artifact payload.'
-                : update.error ?? `Deep Research ${update.status}: ${update.active_step}`,
+                ? (update.artifact ?? 'Deep Research completed without an artifact payload.')
+                : (update.error ?? `Deep Research ${update.status}: ${update.active_step}`),
             status: update.status === 'completed' || update.status === 'failed' ? 'complete' : 'streaming',
           };
         }),

@@ -15,7 +15,7 @@ import {
 import { executeLocalGemma, dispatchDeepResearch } from './ipc/tauriCommands';
 import { registerTauriEventHandlers } from './ipc/tauriEvents';
 import { parseResearchCommand } from './domain/parsers';
-import { researchMessageId, useUndergroundStore } from './state/undergroundStore';
+import { useUndergroundStore } from './state/undergroundStore';
 import type { DispatchDeepResearchPayload, ExecuteLocalGemmaPayload, TacticalMessage } from './domain/types';
 
 export default function App() {
@@ -159,7 +159,7 @@ export default function App() {
                 <span className="mb-1 block text-[10px] font-bold uppercase tracking-wider text-[#20bd90] drop-shadow-[0_0_5px_rgba(32,189,144,0.3)]">
                   Target Context Extracted
                 </span>
-                <span className="line-clamp-2 pr-4 text-xs italic text-white/80">"{scalpelContext}"</span>
+                <span className="line-clamp-2 pr-4 text-xs italic text-white/80">&ldquo;{scalpelContext}&rdquo;</span>
               </div>
               <button
                 aria-label="Clear extracted context"
@@ -380,8 +380,8 @@ function ArtifactPane({
 function EmptyStream() {
   return (
     <div className="mx-auto mt-20 max-w-sm text-center text-xs leading-relaxed text-white/40">
-      Standard text routes to local Gemma. Commands prefixed with <span className="text-[#20bd90]">/research</span> route
-      directly to cloud Deep Research.
+      Standard text routes to local Gemma. Commands prefixed with <span className="text-[#20bd90]">/research</span>{' '}
+      route directly to cloud Deep Research.
     </div>
   );
 }
@@ -390,7 +390,9 @@ function ResearchSkeleton({ activeStep }: { activeStep: string }) {
   return (
     <div className="space-y-5">
       <div>
-        <span className="mb-2 block text-[10px] font-bold uppercase tracking-wider text-[#20bd90]">Deep Research Running</span>
+        <span className="mb-2 block text-[10px] font-bold uppercase tracking-wider text-[#20bd90]">
+          Deep Research Running
+        </span>
         <p className="text-xs leading-relaxed text-white/60">{activeStep}</p>
       </div>
       {[64, 112, 84, 140, 96].map((width, index) => (

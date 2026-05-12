@@ -109,7 +109,7 @@ textarea {
 .artifact-skeleton::after {
   position: absolute;
   inset: 0;
-  content: "";
+  content: '';
   transform: translateX(-100%);
   animation: skeletonSweep 1.4s infinite;
   background: linear-gradient(90deg, transparent, rgba(32, 189, 144, 0.16), transparent);
