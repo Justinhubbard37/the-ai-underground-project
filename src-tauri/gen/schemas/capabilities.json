@@ -1,1 +1,14 @@
-{}
+{
+    "default":  {
+                    "identifier":  "default",
+                    "description":  "Default permissions for the main desktop window.",
+                    "local":  true,
+                    "windows":  [
+                                    "main"
+                                ],
+                    "permissions":  [
+                                        "core:event:allow-listen",
+                                        "core:event:allow-unlisten"
+                                    ]
+                }
+}
