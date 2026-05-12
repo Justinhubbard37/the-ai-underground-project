@@ -1,0 +1,122 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+  background: #030305;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+  overflow: hidden;
+}
+
+button,
+textarea {
+  font: inherit;
+}
+
+::-webkit-scrollbar {
+  width: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 10px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.2);
+}
+
+@keyframes fadeSlideUp {
+  from {
+    opacity: 0;
+    transform: translateY(15px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.artifact-markup h1,
+.artifact-markup h2,
+.artifact-markup h3 {
+  color: #e1f5f9;
+  margin: 1.25rem 0 0.75rem;
+  line-height: 1.2;
+}
+
+.artifact-markup h2 {
+  font-size: 1.05rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.artifact-markup h3 {
+  font-size: 0.85rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.artifact-markup p,
+.artifact-markup li {
+  color: rgba(255, 255, 255, 0.72);
+  line-height: 1.85;
+}
+
+.artifact-markup code {
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 0.35rem;
+  background: rgba(255, 255, 255, 0.1);
+  color: #e1f5f9;
+  padding: 0.08rem 0.35rem;
+}
+
+.artifact-markup table {
+  width: 100%;
+  border-collapse: collapse;
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 0.75rem;
+}
+
+.artifact-markup th,
+.artifact-markup td {
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  padding: 0.75rem;
+  text-align: left;
+}
+
+.artifact-skeleton {
+  position: relative;
+  overflow: hidden;
+}
+
+.artifact-skeleton::after {
+  position: absolute;
+  inset: 0;
+  content: "";
+  transform: translateX(-100%);
+  animation: skeletonSweep 1.4s infinite;
+  background: linear-gradient(90deg, transparent, rgba(32, 189, 144, 0.16), transparent);
+}
+
+@keyframes skeletonSweep {
+  100% {
+    transform: translateX(100%);
+  }
+}
