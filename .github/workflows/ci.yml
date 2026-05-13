@@ -1,0 +1,70 @@
+name: CI Verification
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: windows-latest
+
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Set up Rust stable with rustfmt
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Print tool versions
+        run: |
+          node --version
+          npm --version
+          rustc --version
+          cargo --version
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Run frontend format check
+        run: npm.cmd run format:check
+
+      - name: Run frontend lint
+        run: npm.cmd run lint
+
+      - name: Run frontend typecheck
+        run: npm.cmd run typecheck
+
+      - name: Run frontend build
+        run: npm.cmd run build
+
+      - name: Run Rust format check
+        working-directory: src-tauri
+        run: cargo fmt --check
+
+      - name: Run Rust check
+        working-directory: src-tauri
+        run: cargo check
+
+      - name: Run Rust tests
+        working-directory: src-tauri
+        run: cargo test
+
+      - name: Print repository status
+        if: always()
+        run: git status --short
