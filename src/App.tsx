@@ -34,20 +34,36 @@ export default function App() {
   } = useUndergroundStore();
 
   useEffect(() => {
-    let unlisten: (() => void) | undefined;
+    let disposed = false;
+    let cleanup: (() => void) | undefined;
+
+    const runCleanup = () => {
+      cleanup?.();
+      cleanup = undefined;
+    };
 
     registerTauriEventHandlers()
-      .then((cleanup) => {
-        unlisten = cleanup;
+      .then((nextCleanup) => {
+        if (disposed) {
+          nextCleanup();
+          return;
+        }
+
+        cleanup = nextCleanup;
       })
       .catch((error) => {
+        if (disposed) {
+          return;
+        }
+
         const id = crypto.randomUUID();
         startLocalModelMessage(id);
         failModelMessage(id, `Tauri event channel failed to initialize: ${String(error)}`);
       });
 
     return () => {
-      unlisten?.();
+      disposed = true;
+      runCleanup();
     };
   }, [failModelMessage, startLocalModelMessage]);
 
