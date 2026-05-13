@@ -38,6 +38,26 @@ export interface DeepResearchStarted {
   task_id: string;
 }
 
+export type ActiveModelIdentityStatus =
+  | 'configured'
+  | 'missing_endpoint'
+  | 'missing_model'
+  | 'missing_profile'
+  | 'unknown_profile'
+  | 'invalid_endpoint';
+
+export interface ActiveModelIdentity {
+  status: ActiveModelIdentityStatus;
+  profile_id: string | null;
+  display_name: string;
+  runtime_label: string;
+  runtime_model_id: string | null;
+  endpoint_configured: boolean;
+  model_configured: boolean;
+  profile_known: boolean;
+  detail: string | null;
+}
+
 export interface LocalGemmaUpdate {
   run_id: string;
   delta: string;

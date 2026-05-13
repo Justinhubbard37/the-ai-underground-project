@@ -1,11 +1,16 @@
 import { create } from 'zustand';
-import type { ResearchTask, ResearchUpdate, TacticalMessage } from '../domain/types';
+import type { ActiveModelIdentity, ResearchTask, ResearchUpdate, TacticalMessage } from '../domain/types';
 import { extractThoughtSummary } from '../domain/parsers';
+
+type ActiveModelIdentityLoadStatus = 'idle' | 'loading' | 'ready' | 'error';
 
 interface UndergroundState {
   local_tactical_stream: TacticalMessage[];
   cloud_research_queue: ResearchTask[];
   artifact_canvas_state: string;
+  active_model_identity: ActiveModelIdentity | null;
+  active_model_identity_status: ActiveModelIdentityLoadStatus;
+  active_model_identity_error: string | null;
   addUserMessage: (content: string) => void;
   startLocalModelMessage: (id: string) => void;
   startResearchModelMessage: (taskId: string, query: string) => void;
@@ -14,12 +19,18 @@ interface UndergroundState {
   failModelMessage: (id: string, error: string) => void;
   enqueueResearchTask: (task: ResearchTask) => void;
   applyResearchUpdate: (update: ResearchUpdate) => void;
+  setActiveModelIdentityLoading: () => void;
+  setActiveModelIdentity: (identity: ActiveModelIdentity) => void;
+  failActiveModelIdentity: (error: string) => void;
 }
 
 export const useUndergroundStore = create<UndergroundState>((set) => ({
   local_tactical_stream: [],
   cloud_research_queue: [],
   artifact_canvas_state: '',
+  active_model_identity: null,
+  active_model_identity_status: 'idle',
+  active_model_identity_error: null,
 
   addUserMessage: (content) =>
     set((state) => ({
@@ -144,6 +155,26 @@ export const useUndergroundStore = create<UndergroundState>((set) => ({
           };
         }),
       };
+    }),
+
+  setActiveModelIdentityLoading: () =>
+    set({
+      active_model_identity_status: 'loading',
+      active_model_identity_error: null,
+    }),
+
+  setActiveModelIdentity: (identity) =>
+    set({
+      active_model_identity: identity,
+      active_model_identity_status: 'ready',
+      active_model_identity_error: null,
+    }),
+
+  failActiveModelIdentity: (error) =>
+    set({
+      active_model_identity: null,
+      active_model_identity_status: 'error',
+      active_model_identity_error: error,
     }),
 }));
 

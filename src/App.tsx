@@ -12,11 +12,16 @@ import {
   Sparkles,
   Terminal,
 } from 'lucide-react';
-import { executeLocalGemma, dispatchDeepResearch } from './ipc/tauriCommands';
+import { dispatchDeepResearch, executeLocalGemma, getActiveModelIdentity } from './ipc/tauriCommands';
 import { registerTauriEventHandlers } from './ipc/tauriEvents';
 import { parseResearchCommand } from './domain/parsers';
 import { useUndergroundStore } from './state/undergroundStore';
-import type { DispatchDeepResearchPayload, ExecuteLocalGemmaPayload, TacticalMessage } from './domain/types';
+import type {
+  ActiveModelIdentity,
+  DispatchDeepResearchPayload,
+  ExecuteLocalGemmaPayload,
+  TacticalMessage,
+} from './domain/types';
 
 export default function App() {
   const [tacticalInput, setTacticalInput] = useState('');
@@ -26,11 +31,17 @@ export default function App() {
     local_tactical_stream,
     cloud_research_queue,
     artifact_canvas_state,
+    active_model_identity,
+    active_model_identity_status,
+    active_model_identity_error,
     addUserMessage,
     startLocalModelMessage,
     startResearchModelMessage,
     enqueueResearchTask,
     failModelMessage,
+    setActiveModelIdentityLoading,
+    setActiveModelIdentity,
+    failActiveModelIdentity,
   } = useUndergroundStore();
 
   useEffect(() => {
@@ -66,6 +77,31 @@ export default function App() {
       runCleanup();
     };
   }, [failModelMessage, startLocalModelMessage]);
+
+  useEffect(() => {
+    let disposed = false;
+
+    setActiveModelIdentityLoading();
+    getActiveModelIdentity()
+      .then((identity) => {
+        if (disposed) {
+          return;
+        }
+
+        setActiveModelIdentity(identity);
+      })
+      .catch((error) => {
+        if (disposed) {
+          return;
+        }
+
+        failActiveModelIdentity(normalizeError(error));
+      });
+
+    return () => {
+      disposed = true;
+    };
+  }, [failActiveModelIdentity, setActiveModelIdentity, setActiveModelIdentityLoading]);
 
   const activeResearchTask = useMemo(
     () => cloud_research_queue.find((task) => task.status === 'running' || task.status === 'queued') ?? null,
@@ -149,6 +185,11 @@ export default function App() {
             <span className="rounded border border-[#20bd90]/20 bg-[#20bd90]/10 px-2 py-0.5 text-[9px] font-bold tracking-wide text-[#20bd90]">
               Explicit Routing
             </span>
+            <ActiveModelBadge
+              identity={active_model_identity}
+              status={active_model_identity_status}
+              error={active_model_identity_error}
+            />
           </div>
           <Sparkles size={14} className="text-white/40" />
         </div>
@@ -297,6 +338,59 @@ function TelemetryPane({ tasks }: { tasks: ReturnType<typeof useUndergroundStore
       </div>
     </aside>
   );
+}
+
+function ActiveModelBadge({
+  identity,
+  status,
+  error,
+}: {
+  identity: ActiveModelIdentity | null;
+  status: 'idle' | 'loading' | 'ready' | 'error';
+  error: string | null;
+}) {
+  const label = activeModelLabel(identity, status);
+  const detail = activeModelDetail(identity, error);
+
+  return (
+    <span
+      title={detail}
+      className="rounded border border-[#5994d7]/20 bg-[#5994d7]/10 px-2 py-0.5 text-[9px] font-bold tracking-wide text-[#e1f5f9]"
+    >
+      {label}
+    </span>
+  );
+}
+
+function activeModelLabel(
+  identity: ActiveModelIdentity | null,
+  status: 'idle' | 'loading' | 'ready' | 'error',
+): string {
+  if (status === 'loading' || status === 'idle') {
+    return 'Local Model: Checking';
+  }
+
+  if (status === 'error') {
+    return 'Local Model: Unavailable';
+  }
+
+  if (!identity) {
+    return 'Local Model: Unknown';
+  }
+
+  return `Local Model: ${identity.display_name}`;
+}
+
+function activeModelDetail(identity: ActiveModelIdentity | null, error: string | null): string | undefined {
+  if (error) {
+    return error;
+  }
+
+  if (!identity) {
+    return undefined;
+  }
+
+  return identity.detail ?? undefined;
 }
 
 function TacticalMessageBlock({

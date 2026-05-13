@@ -51,6 +51,30 @@ struct DeepResearchStarted {
     task_id: String,
 }
 
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ActiveModelIdentityStatus {
+    Configured,
+    MissingEndpoint,
+    MissingModel,
+    MissingProfile,
+    UnknownProfile,
+    InvalidEndpoint,
+}
+
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+struct ActiveModelIdentity {
+    status: ActiveModelIdentityStatus,
+    profile_id: Option<String>,
+    display_name: String,
+    runtime_label: String,
+    runtime_model_id: Option<String>,
+    endpoint_configured: bool,
+    model_configured: bool,
+    profile_known: bool,
+    detail: Option<String>,
+}
+
 #[derive(Debug, Serialize, Clone)]
 struct LocalGemmaUpdate {
     run_id: String,
@@ -306,6 +330,11 @@ async fn dispatch_deep_research(
     Ok(DeepResearchStarted { task_id })
 }
 
+#[tauri::command]
+fn get_active_model_identity() -> ActiveModelIdentity {
+    active_model_identity_from_env()
+}
+
 pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
@@ -316,7 +345,8 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             execute_local_gemma,
-            dispatch_deep_research
+            dispatch_deep_research,
+            get_active_model_identity
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -417,7 +447,8 @@ async fn run_local_gemma(app: AppHandle, run_id: String, payload: ExecuteLocalGe
             let message = if error.is_timeout() {
                 "Local model request timed out.".to_string()
             } else if error.is_connect() {
-                "Could not reach local model endpoint. Confirm LM Studio is running.".to_string()
+                "Could not reach local model endpoint. Confirm the local model runtime is running."
+                    .to_string()
             } else {
                 "Local model request failed.".to_string()
             };
@@ -460,6 +491,117 @@ fn required_env(key: &str, missing_message: &str) -> Result<String, String> {
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .ok_or_else(|| missing_message.to_string())
+}
+
+fn optional_env(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn active_model_identity_from_env() -> ActiveModelIdentity {
+    active_model_identity_from_values(
+        optional_env("AI_UNDERGROUND_GEMMA_ENDPOINT"),
+        optional_env("AI_UNDERGROUND_GEMMA_MODEL"),
+        optional_env("AI_UNDERGROUND_GEMMA_PROFILE"),
+    )
+}
+
+fn active_model_identity_from_values(
+    endpoint: Option<String>,
+    model: Option<String>,
+    profile_id: Option<String>,
+) -> ActiveModelIdentity {
+    let endpoint_configured = endpoint.is_some();
+    let model_configured = model.is_some();
+
+    let Some(endpoint) = endpoint else {
+        return inactive_model_identity(
+            ActiveModelIdentityStatus::MissingEndpoint,
+            profile_id,
+            "Not Configured",
+            endpoint_configured,
+            model_configured,
+            "Local model endpoint is not configured.",
+        );
+    };
+
+    let Some(model) = model else {
+        return inactive_model_identity(
+            ActiveModelIdentityStatus::MissingModel,
+            profile_id,
+            "Not Configured",
+            endpoint_configured,
+            model_configured,
+            "Local model id is not configured.",
+        );
+    };
+
+    if validate_local_model_endpoint(&endpoint).is_err() {
+        return inactive_model_identity(
+            ActiveModelIdentityStatus::InvalidEndpoint,
+            profile_id,
+            "Endpoint Blocked",
+            endpoint_configured,
+            model_configured,
+            "Endpoint must be localhost and target /v1/chat/completions.",
+        );
+    }
+
+    let Some(profile_id) = profile_id else {
+        return inactive_model_identity(
+            ActiveModelIdentityStatus::MissingProfile,
+            None,
+            "Profile Not Set",
+            endpoint_configured,
+            model_configured,
+            "Set AI_UNDERGROUND_GEMMA_PROFILE to show a verified local model profile.",
+        );
+    };
+
+    match model_profile(&profile_id, &model) {
+        Ok(profile) => ActiveModelIdentity {
+            status: ActiveModelIdentityStatus::Configured,
+            profile_id: Some(profile.profile_id.to_string()),
+            display_name: profile.display_name.to_string(),
+            runtime_label: "OpenAI-compatible local runtime".to_string(),
+            runtime_model_id: Some(profile.runtime_model_id),
+            endpoint_configured,
+            model_configured,
+            profile_known: true,
+            detail: None,
+        },
+        Err(_) => inactive_model_identity(
+            ActiveModelIdentityStatus::UnknownProfile,
+            Some(profile_id),
+            "Unknown Profile",
+            endpoint_configured,
+            model_configured,
+            "Configured local model profile is not recognized.",
+        ),
+    }
+}
+
+fn inactive_model_identity(
+    status: ActiveModelIdentityStatus,
+    profile_id: Option<String>,
+    display_name: &str,
+    endpoint_configured: bool,
+    model_configured: bool,
+    detail: &str,
+) -> ActiveModelIdentity {
+    ActiveModelIdentity {
+        status,
+        profile_id,
+        display_name: display_name.to_string(),
+        runtime_label: "Local Runtime".to_string(),
+        runtime_model_id: None,
+        endpoint_configured,
+        model_configured,
+        profile_known: false,
+        detail: Some(detail.to_string()),
+    }
 }
 
 fn validate_local_model_endpoint(raw_endpoint: &str) -> Result<Url, String> {
@@ -534,7 +676,7 @@ fn model_profile(
     match profile_id {
         "gemma4-26b-a4b" => Ok(ModelCapabilityProfile {
             profile_id: "gemma4-26b-a4b",
-            display_name: "Gemma4 26B A4B",
+            display_name: "Gemma4-26B-MoE",
             runtime_model_id: runtime_model_id.to_string(),
             runtime_engine: RuntimeEngine::LmStudio,
             supports_text_input: CapabilitySupport::Yes,
@@ -550,7 +692,7 @@ fn model_profile(
         }),
         "gemma4-31b" => Ok(ModelCapabilityProfile {
             profile_id: "gemma4-31b",
-            display_name: "Gemma4 31B",
+            display_name: "Gemma4-31B Dense",
             runtime_model_id: runtime_model_id.to_string(),
             runtime_engine: RuntimeEngine::LmStudio,
             supports_text_input: CapabilitySupport::Unknown,
@@ -566,7 +708,7 @@ fn model_profile(
         }),
         "supergemma4-26b-uncensored" => Ok(ModelCapabilityProfile {
             profile_id: "supergemma4-26b-uncensored",
-            display_name: "SuperGemma4 26B Uncensored GGUF v2",
+            display_name: "Gemma4-26B-Uncensored",
             runtime_model_id: runtime_model_id.to_string(),
             runtime_engine: RuntimeEngine::LmStudio,
             supports_text_input: CapabilitySupport::Yes,
@@ -1152,5 +1294,112 @@ mod tests {
 
         assert!(snippet.ends_with("..."));
         assert!(snippet.chars().count() <= 243);
+    }
+
+    #[test]
+    fn model_profile_maps_approved_display_labels() {
+        let gemma_moe = model_profile("gemma4-26b-a4b", "runtime-id").expect("profile should map");
+        let gemma_dense = model_profile("gemma4-31b", "runtime-id").expect("profile should map");
+        let supergemma =
+            model_profile("supergemma4-26b-uncensored", "runtime-id").expect("profile should map");
+
+        assert_eq!(gemma_moe.display_name, "Gemma4-26B-MoE");
+        assert_eq!(gemma_dense.display_name, "Gemma4-31B Dense");
+        assert_eq!(supergemma.display_name, "Gemma4-26B-Uncensored");
+        assert!(supergemma.explicit_uncensored_label);
+    }
+
+    #[test]
+    fn active_identity_returns_unknown_profile_state() {
+        let identity = active_model_identity_from_values(
+            Some("http://127.0.0.1:1234/v1/chat/completions".to_string()),
+            Some("google/gemma-4-31b".to_string()),
+            Some("unknown-profile".to_string()),
+        );
+
+        assert_eq!(identity.status, ActiveModelIdentityStatus::UnknownProfile);
+        assert_eq!(identity.display_name, "Unknown Profile");
+        assert_eq!(identity.profile_id, Some("unknown-profile".to_string()));
+        assert!(!identity.profile_known);
+    }
+
+    #[test]
+    fn active_identity_returns_missing_profile_state() {
+        let identity = active_model_identity_from_values(
+            Some("http://127.0.0.1:1234/v1/chat/completions".to_string()),
+            Some("google/gemma-4-31b".to_string()),
+            None,
+        );
+
+        assert_eq!(identity.status, ActiveModelIdentityStatus::MissingProfile);
+        assert_eq!(identity.display_name, "Profile Not Set");
+        assert_eq!(identity.profile_id, None);
+        assert!(!identity.profile_known);
+    }
+
+    #[test]
+    fn active_identity_returns_missing_endpoint_state() {
+        let identity = active_model_identity_from_values(
+            None,
+            Some("google/gemma-4-31b".to_string()),
+            Some("gemma4-31b".to_string()),
+        );
+
+        assert_eq!(identity.status, ActiveModelIdentityStatus::MissingEndpoint);
+        assert_eq!(identity.display_name, "Not Configured");
+        assert!(!identity.endpoint_configured);
+        assert!(identity.model_configured);
+        assert!(!identity.profile_known);
+    }
+
+    #[test]
+    fn active_identity_returns_missing_model_state() {
+        let identity = active_model_identity_from_values(
+            Some("http://127.0.0.1:1234/v1/chat/completions".to_string()),
+            None,
+            Some("gemma4-31b".to_string()),
+        );
+
+        assert_eq!(identity.status, ActiveModelIdentityStatus::MissingModel);
+        assert_eq!(identity.display_name, "Not Configured");
+        assert!(identity.endpoint_configured);
+        assert!(!identity.model_configured);
+        assert!(!identity.profile_known);
+    }
+
+    #[test]
+    fn active_identity_does_not_expose_invalid_endpoint_value() {
+        let remote_endpoint = "http://example.com/v1/chat/completions";
+        let identity = active_model_identity_from_values(
+            Some(remote_endpoint.to_string()),
+            Some("google/gemma-4-31b".to_string()),
+            Some("gemma4-31b".to_string()),
+        );
+
+        assert_eq!(identity.status, ActiveModelIdentityStatus::InvalidEndpoint);
+        assert_eq!(identity.display_name, "Endpoint Blocked");
+        assert_ne!(identity.detail.as_deref(), Some(remote_endpoint));
+        assert!(!identity
+            .detail
+            .unwrap_or_default()
+            .contains(remote_endpoint));
+    }
+
+    #[test]
+    fn active_identity_returns_configured_profile_state() {
+        let identity = active_model_identity_from_values(
+            Some("http://localhost:1234/v1/chat/completions".to_string()),
+            Some("google/gemma-4-31b".to_string()),
+            Some("gemma4-31b".to_string()),
+        );
+
+        assert_eq!(identity.status, ActiveModelIdentityStatus::Configured);
+        assert_eq!(identity.display_name, "Gemma4-31B Dense");
+        assert_eq!(identity.runtime_label, "OpenAI-compatible local runtime");
+        assert_eq!(
+            identity.runtime_model_id,
+            Some("google/gemma-4-31b".to_string())
+        );
+        assert!(identity.profile_known);
     }
 }

@@ -35,3 +35,22 @@ export const researchUpdateSchema = z.object({
   artifact: z.string().nullable(),
   error: z.string().nullable(),
 });
+
+export const activeModelIdentitySchema = z.object({
+  status: z.enum([
+    'configured',
+    'missing_endpoint',
+    'missing_model',
+    'missing_profile',
+    'unknown_profile',
+    'invalid_endpoint',
+  ]),
+  profile_id: z.string().nullable(),
+  display_name: z.string(),
+  runtime_label: z.string(),
+  runtime_model_id: z.string().nullable(),
+  endpoint_configured: z.boolean(),
+  model_configured: z.boolean(),
+  profile_known: z.boolean(),
+  detail: z.string().nullable(),
+});
