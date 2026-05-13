@@ -2,15 +2,14 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use chrono::Utc;
-use reqwest::Client;
+use reqwest::{Client, Url};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
 use uuid::Uuid;
 
 const LOCAL_GEMMA_TEMPERATURE: f32 = 0.2;
-const LOCAL_GEMMA_SYSTEM_PROMPT: &str =
-    "You are the local tactical model for The AI Underground. Keep routing local and never call cloud tools.";
+const LOCAL_GEMMA_DEFAULT_TIMEOUT_SECONDS: u64 = 120;
 const POLL_INTERVAL: Duration = Duration::from_secs(10);
 
 const VECTOR_SCHEMA_SQL: &str = r#"
@@ -103,6 +102,144 @@ struct GenericInteractionResponse {
     error: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct LocalGemmaConfig {
+    endpoint: Url,
+    model: String,
+    profile: Option<ModelCapabilityProfile>,
+    timeout: Duration,
+}
+
+#[derive(Debug, Clone)]
+struct ContextPacket {
+    prompt: String,
+    scalpel_context: Option<String>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CapabilitySupport {
+    Yes,
+    No,
+    Unknown,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeEngine {
+    LmStudio,
+    LlamaCppSidecar,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+struct ModelCapabilityProfile {
+    profile_id: &'static str,
+    display_name: &'static str,
+    runtime_model_id: String,
+    runtime_engine: RuntimeEngine,
+    supports_text_input: CapabilitySupport,
+    supports_image_input: CapabilitySupport,
+    supports_video_frame_input: CapabilitySupport,
+    supports_function_calling: CapabilitySupport,
+    supports_structured_output: CapabilitySupport,
+    supports_streaming: CapabilitySupport,
+    supports_embeddings: CapabilitySupport,
+    default_enabled_tools: Vec<&'static str>,
+    risk_notes: &'static str,
+    explicit_uncensored_label: bool,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolImplementationStatus {
+    Planned,
+    Disabled,
+    Mvp,
+    Active,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolRiskLevel {
+    Low,
+    Medium,
+    High,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolLocation {
+    Local,
+    RemoteCapable,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+struct ToolRegistryEntry {
+    tool_id: &'static str,
+    display_name: &'static str,
+    description: &'static str,
+    enabled: bool,
+    local_or_remote: ToolLocation,
+    requires_user_approval: bool,
+    input_schema: serde_json::Value,
+    output_schema: serde_json::Value,
+    supported_model_capabilities: Vec<&'static str>,
+    risk_level: ToolRiskLevel,
+    ui_affordance_requirement: &'static str,
+    implementation_status: ToolImplementationStatus,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum UserApprovalState {
+    NotRequired,
+    Required,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ModelResponseEvent {
+    ModelText(String),
+    ToolCallRequested {
+        approval_required: UserApprovalState,
+    },
+    Error(String),
+    Complete,
+}
+
+#[derive(Debug, Serialize)]
+struct OpenAiChatCompletionRequest {
+    model: String,
+    messages: Vec<OpenAiChatMessage>,
+    temperature: f32,
+    stream: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct OpenAiChatMessage {
+    role: &'static str,
+    content: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiChatCompletionResponse {
+    choices: Vec<OpenAiChoice>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiChoice {
+    message: Option<OpenAiMessage>,
+    text: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiMessage {
+    content: Option<String>,
+    tool_calls: Option<Vec<serde_json::Value>>,
+}
+
 #[tauri::command]
 async fn execute_local_gemma(
     app: AppHandle,
@@ -186,34 +323,67 @@ pub fn run() {
 }
 
 async fn run_local_gemma(app: AppHandle, run_id: String, payload: ExecuteLocalGemmaRequest) {
-    let Some(endpoint) = std::env::var("AI_UNDERGROUND_GEMMA_ENDPOINT").ok() else {
-        emit_local_update(
-            &app,
-            LocalGemmaUpdate {
-                run_id,
-                delta: String::new(),
-                done: true,
-                error: Some(
-                    "AI_UNDERGROUND_GEMMA_ENDPOINT is not configured for local Gemma streaming."
-                        .to_string(),
-                ),
-            },
-        );
-        return;
+    let config = match load_local_gemma_config() {
+        Ok(config) => config,
+        Err(error) => {
+            emit_local_error(&app, run_id, error);
+            return;
+        }
     };
 
-    let client = Client::new();
-    let request = serde_json::json!({
-        "prompt": payload.prompt,
-        "scalpel_context": payload.scalpel_context,
-        "temperature": LOCAL_GEMMA_TEMPERATURE,
-        "system_prompt": LOCAL_GEMMA_SYSTEM_PROMPT
-    });
+    let context_packet = ContextPacket {
+        prompt: payload.prompt,
+        scalpel_context: payload.scalpel_context,
+    };
+    let request = build_openai_chat_request(&config, &context_packet);
 
-    match client.post(endpoint).json(&request).send().await {
-        Ok(response) => match response.text().await {
-            Ok(text) => {
-                emit_local_update(
+    let client = match Client::builder().timeout(config.timeout).build() {
+        Ok(client) => client,
+        Err(_) => {
+            emit_local_error(
+                &app,
+                run_id,
+                "Could not initialize local model client.".to_string(),
+            );
+            return;
+        }
+    };
+
+    match client
+        .post(config.endpoint.clone())
+        .json(&request)
+        .send()
+        .await
+    {
+        Ok(response) => {
+            let status = response.status();
+            let body = match response.text().await {
+                Ok(body) => body,
+                Err(_) => {
+                    emit_local_error(
+                        &app,
+                        run_id,
+                        "Could not read local model response.".to_string(),
+                    );
+                    return;
+                }
+            };
+
+            if !status.is_success() {
+                emit_local_error(
+                    &app,
+                    run_id,
+                    format!(
+                        "Local model endpoint returned HTTP {}: {}",
+                        status.as_u16(),
+                        short_response_snippet(&body)
+                    ),
+                );
+                return;
+            }
+
+            match normalize_openai_response(&body) {
+                Ok(ModelResponseEvent::ModelText(text)) => emit_local_update(
                     &app,
                     LocalGemmaUpdate {
                         run_id,
@@ -221,28 +391,342 @@ async fn run_local_gemma(app: AppHandle, run_id: String, payload: ExecuteLocalGe
                         done: true,
                         error: None,
                     },
-                );
-            }
-            Err(error) => emit_local_update(
-                &app,
-                LocalGemmaUpdate {
+                ),
+                Ok(ModelResponseEvent::ToolCallRequested {
+                    approval_required: UserApprovalState::Required,
+                }) => emit_local_error(
+                    &app,
                     run_id,
-                    delta: String::new(),
-                    done: true,
-                    error: Some(format!("Local Gemma response read failed: {error}")),
-                },
-            ),
-        },
-        Err(error) => emit_local_update(
-            &app,
-            LocalGemmaUpdate {
-                run_id,
-                delta: String::new(),
-                done: true,
-                error: Some(format!("Local Gemma request failed: {error}")),
-            },
-        ),
+                    "The local model requested a tool call, but tool execution is disabled in Phase 3."
+                        .to_string(),
+                ),
+                Ok(ModelResponseEvent::ToolCallRequested { .. }) => emit_local_error(
+                    &app,
+                    run_id,
+                    "The local model returned a tool-call response without text.".to_string(),
+                ),
+                Ok(ModelResponseEvent::Error(error)) | Err(error) => {
+                    emit_local_error(&app, run_id, error)
+                }
+                Ok(ModelResponseEvent::Complete) => {
+                    emit_local_error(&app, run_id, "Local model response was empty.".to_string())
+                }
+            }
+        }
+        Err(error) => {
+            let message = if error.is_timeout() {
+                "Local model request timed out.".to_string()
+            } else if error.is_connect() {
+                "Could not reach local model endpoint. Confirm LM Studio is running.".to_string()
+            } else {
+                "Local model request failed.".to_string()
+            };
+            emit_local_error(&app, run_id, message);
+        }
     }
+}
+
+fn load_local_gemma_config() -> Result<LocalGemmaConfig, String> {
+    let endpoint = required_env(
+        "AI_UNDERGROUND_GEMMA_ENDPOINT",
+        "Local model endpoint is not configured.",
+    )?;
+    let model = required_env(
+        "AI_UNDERGROUND_GEMMA_MODEL",
+        "Local model id is not configured.",
+    )?;
+    let endpoint = validate_local_model_endpoint(&endpoint)?;
+    let profile = match std::env::var("AI_UNDERGROUND_GEMMA_PROFILE")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        Some(profile_id) => Some(model_profile(&profile_id, &model)?),
+        None => None,
+    };
+    let timeout = local_gemma_timeout();
+
+    Ok(LocalGemmaConfig {
+        endpoint,
+        model,
+        profile,
+        timeout,
+    })
+}
+
+fn required_env(key: &str, missing_message: &str) -> Result<String, String> {
+    std::env::var(key)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| missing_message.to_string())
+}
+
+fn validate_local_model_endpoint(raw_endpoint: &str) -> Result<Url, String> {
+    let endpoint = Url::parse(raw_endpoint)
+        .map_err(|_| "Local model endpoint must be a valid localhost HTTP URL.".to_string())?;
+
+    if endpoint.scheme() != "http" {
+        return Err("Local model endpoint must use http on localhost.".to_string());
+    }
+
+    let Some(host) = endpoint.host_str() else {
+        return Err("Local model endpoint must include a localhost host.".to_string());
+    };
+
+    if !matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]") {
+        return Err("Local model endpoint must target localhost or loopback only.".to_string());
+    }
+
+    if endpoint.path() != "/v1/chat/completions" {
+        return Err("Local model endpoint must target /v1/chat/completions.".to_string());
+    }
+
+    Ok(endpoint)
+}
+
+fn local_gemma_timeout() -> Duration {
+    std::env::var("AI_UNDERGROUND_GEMMA_TIMEOUT_SECONDS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .map(Duration::from_secs)
+        .unwrap_or_else(|| Duration::from_secs(LOCAL_GEMMA_DEFAULT_TIMEOUT_SECONDS))
+}
+
+fn build_openai_chat_request(
+    config: &LocalGemmaConfig,
+    context_packet: &ContextPacket,
+) -> OpenAiChatCompletionRequest {
+    let content = assemble_context_packet(context_packet);
+    let _profile_id = config.profile.as_ref().map(|profile| profile.profile_id);
+
+    OpenAiChatCompletionRequest {
+        model: config.model.clone(),
+        messages: vec![OpenAiChatMessage {
+            role: "user",
+            content,
+        }],
+        temperature: LOCAL_GEMMA_TEMPERATURE,
+        stream: false,
+    }
+}
+
+fn assemble_context_packet(context_packet: &ContextPacket) -> String {
+    match context_packet
+        .scalpel_context
+        .as_ref()
+        .map(|context| context.trim())
+        .filter(|context| !context.is_empty())
+    {
+        Some(context) => format!(
+            "Local context selected by the user:\n{context}\n\nUser prompt:\n{}",
+            context_packet.prompt
+        ),
+        None => context_packet.prompt.clone(),
+    }
+}
+
+fn model_profile(
+    profile_id: &str,
+    runtime_model_id: &str,
+) -> Result<ModelCapabilityProfile, String> {
+    match profile_id {
+        "gemma4-26b-a4b" => Ok(ModelCapabilityProfile {
+            profile_id: "gemma4-26b-a4b",
+            display_name: "Gemma4 26B A4B",
+            runtime_model_id: runtime_model_id.to_string(),
+            runtime_engine: RuntimeEngine::LmStudio,
+            supports_text_input: CapabilitySupport::Yes,
+            supports_image_input: CapabilitySupport::Yes,
+            supports_video_frame_input: CapabilitySupport::Unknown,
+            supports_function_calling: CapabilitySupport::Yes,
+            supports_structured_output: CapabilitySupport::Unknown,
+            supports_streaming: CapabilitySupport::Unknown,
+            supports_embeddings: CapabilitySupport::Unknown,
+            default_enabled_tools: vec![],
+            risk_notes: "Runtime capability support must be verified in the loaded local engine.",
+            explicit_uncensored_label: false,
+        }),
+        "gemma4-31b" => Ok(ModelCapabilityProfile {
+            profile_id: "gemma4-31b",
+            display_name: "Gemma4 31B",
+            runtime_model_id: runtime_model_id.to_string(),
+            runtime_engine: RuntimeEngine::LmStudio,
+            supports_text_input: CapabilitySupport::Unknown,
+            supports_image_input: CapabilitySupport::Unknown,
+            supports_video_frame_input: CapabilitySupport::Unknown,
+            supports_function_calling: CapabilitySupport::Unknown,
+            supports_structured_output: CapabilitySupport::Unknown,
+            supports_streaming: CapabilitySupport::Unknown,
+            supports_embeddings: CapabilitySupport::Unknown,
+            default_enabled_tools: vec![],
+            risk_notes: "Treat runtime/model-card capabilities as unknown until verified locally.",
+            explicit_uncensored_label: false,
+        }),
+        "supergemma4-26b-uncensored" => Ok(ModelCapabilityProfile {
+            profile_id: "supergemma4-26b-uncensored",
+            display_name: "SuperGemma4 26B Uncensored GGUF v2",
+            runtime_model_id: runtime_model_id.to_string(),
+            runtime_engine: RuntimeEngine::LmStudio,
+            supports_text_input: CapabilitySupport::Yes,
+            supports_image_input: CapabilitySupport::Unknown,
+            supports_video_frame_input: CapabilitySupport::Unknown,
+            supports_function_calling: CapabilitySupport::Unknown,
+            supports_structured_output: CapabilitySupport::Unknown,
+            supports_streaming: CapabilitySupport::Unknown,
+            supports_embeddings: CapabilitySupport::Unknown,
+            default_enabled_tools: vec![],
+            risk_notes: "Explicit uncensored profile. Do not use as a silent default.",
+            explicit_uncensored_label: true,
+        }),
+        _ => Err("Unknown local model profile.".to_string()),
+    }
+}
+
+#[allow(dead_code)]
+fn planned_tool_registry() -> Vec<ToolRegistryEntry> {
+    vec![
+        planned_tool(
+            "web_search",
+            "Web Search",
+            "Remote-capable search tool. Disabled by default.",
+            ToolLocation::RemoteCapable,
+            ToolRiskLevel::High,
+            "Requires clear enabled state and per-use approval.",
+        ),
+        planned_tool(
+            "image_input",
+            "Image Input",
+            "User-selected image context for vision-capable local models.",
+            ToolLocation::Local,
+            ToolRiskLevel::Medium,
+            "Requires attach-image control and model support indicator.",
+        ),
+        planned_tool(
+            "file_context",
+            "File Context",
+            "User-selected local file context for the model.",
+            ToolLocation::Local,
+            ToolRiskLevel::Medium,
+            "Requires explicit file selection and read-only state.",
+        ),
+        planned_tool(
+            "artifact_create_update",
+            "Artifact Create / Update",
+            "Future model-assisted artifact drafting and editing seam.",
+            ToolLocation::Local,
+            ToolRiskLevel::Medium,
+            "Requires approval before any write or artifact mutation.",
+        ),
+        planned_tool(
+            "memory_lookup",
+            "Memory Lookup",
+            "Future local memory and context lookup seam.",
+            ToolLocation::Local,
+            ToolRiskLevel::Low,
+            "Requires local-only memory availability state.",
+        ),
+        planned_tool(
+            "local_workspace_query",
+            "Local Workspace Query",
+            "Future read-only local project awareness seam.",
+            ToolLocation::Local,
+            ToolRiskLevel::Medium,
+            "Requires approval-gated read-only workspace scope.",
+        ),
+    ]
+}
+
+#[allow(dead_code)]
+fn planned_tool(
+    tool_id: &'static str,
+    display_name: &'static str,
+    description: &'static str,
+    local_or_remote: ToolLocation,
+    risk_level: ToolRiskLevel,
+    ui_affordance_requirement: &'static str,
+) -> ToolRegistryEntry {
+    ToolRegistryEntry {
+        tool_id,
+        display_name,
+        description,
+        enabled: false,
+        local_or_remote,
+        requires_user_approval: true,
+        input_schema: serde_json::json!({ "type": "object" }),
+        output_schema: serde_json::json!({ "type": "object" }),
+        supported_model_capabilities: vec![],
+        risk_level,
+        ui_affordance_requirement,
+        implementation_status: ToolImplementationStatus::Planned,
+    }
+}
+
+fn normalize_openai_response(body: &str) -> Result<ModelResponseEvent, String> {
+    let parsed: OpenAiChatCompletionResponse = serde_json::from_str(body)
+        .map_err(|_| "Local model response was not valid OpenAI-compatible JSON.".to_string())?;
+    let Some(choice) = parsed.choices.first() else {
+        return Err("Local model response did not include any choices.".to_string());
+    };
+
+    if let Some(message) = &choice.message {
+        if message
+            .tool_calls
+            .as_ref()
+            .is_some_and(|tool_calls| !tool_calls.is_empty())
+        {
+            return Ok(ModelResponseEvent::ToolCallRequested {
+                approval_required: UserApprovalState::Required,
+            });
+        }
+
+        if let Some(content) = message.content.as_ref().map(|value| value.trim()) {
+            if !content.is_empty() {
+                return Ok(ModelResponseEvent::ModelText(content.to_string()));
+            }
+        }
+    }
+
+    if let Some(text) = choice.text.as_ref().map(|value| value.trim()) {
+        if !text.is_empty() {
+            return Ok(ModelResponseEvent::ModelText(text.to_string()));
+        }
+    }
+
+    Err("Local model response did not include text content.".to_string())
+}
+
+fn short_response_snippet(body: &str) -> String {
+    let collapsed = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        return "empty response body".to_string();
+    }
+
+    const MAX_SNIPPET_LENGTH: usize = 240;
+    if collapsed.chars().count() > MAX_SNIPPET_LENGTH {
+        format!(
+            "{}...",
+            collapsed
+                .chars()
+                .take(MAX_SNIPPET_LENGTH)
+                .collect::<String>()
+        )
+    } else {
+        collapsed
+    }
+}
+
+fn emit_local_error(app: &AppHandle, run_id: String, error: String) {
+    emit_local_update(
+        app,
+        LocalGemmaUpdate {
+            run_id,
+            delta: String::new(),
+            done: true,
+            error: Some(error),
+        },
+    );
 }
 
 async fn run_deep_research_polling(
@@ -499,4 +983,174 @@ fn emit_local_update(app: &AppHandle, payload: LocalGemmaUpdate) {
 
 fn emit_research_update(app: &AppHandle, payload: ResearchUpdate) {
     let _ = app.emit("research_update", payload);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_endpoint_validation_accepts_localhost() {
+        let endpoint = validate_local_model_endpoint("http://localhost:1234/v1/chat/completions")
+            .expect("localhost should be accepted");
+
+        assert_eq!(endpoint.host_str(), Some("localhost"));
+    }
+
+    #[test]
+    fn local_endpoint_validation_accepts_ipv4_loopback() {
+        let endpoint = validate_local_model_endpoint("http://127.0.0.1:1234/v1/chat/completions")
+            .expect("127.0.0.1 should be accepted");
+
+        assert_eq!(endpoint.host_str(), Some("127.0.0.1"));
+    }
+
+    #[test]
+    fn local_endpoint_validation_accepts_ipv6_loopback() {
+        let endpoint = validate_local_model_endpoint("http://[::1]:1234/v1/chat/completions")
+            .expect("[::1] should be accepted");
+
+        assert!(endpoint.as_str().starts_with("http://[::1]:1234/"));
+    }
+
+    #[test]
+    fn local_endpoint_validation_rejects_wrong_localhost_path() {
+        let error = validate_local_model_endpoint("http://localhost:1234/api/generate")
+            .expect_err("wrong local path should be rejected");
+
+        assert!(error.contains("/v1/chat/completions"));
+    }
+
+    #[test]
+    fn local_endpoint_validation_rejects_lan_private_ips() {
+        let error = validate_local_model_endpoint("http://192.168.1.22:1234/v1/chat/completions")
+            .expect_err("LAN/private IP should be rejected");
+
+        assert!(error.contains("localhost or loopback"));
+    }
+
+    #[test]
+    fn local_endpoint_validation_rejects_public_ips_and_remote_domains() {
+        let public_error = validate_local_model_endpoint("http://8.8.8.8:1234/v1/chat/completions")
+            .expect_err("public IP should be rejected");
+        let remote_error = validate_local_model_endpoint("http://example.com/v1/chat/completions")
+            .expect_err("remote domain should be rejected");
+
+        assert!(public_error.contains("localhost or loopback"));
+        assert!(remote_error.contains("localhost or loopback"));
+    }
+
+    #[test]
+    fn local_endpoint_validation_rejects_malformed_urls() {
+        let error =
+            validate_local_model_endpoint("not a url").expect_err("malformed URL should fail");
+
+        assert!(error.contains("valid localhost HTTP URL"));
+    }
+
+    #[test]
+    fn openai_response_normalization_extracts_message_content() {
+        let body = r#"{
+          "choices": [
+            {
+              "message": {
+                "role": "assistant",
+                "content": "Local Gemma response"
+              }
+            }
+          ]
+        }"#;
+
+        let event = normalize_openai_response(body).expect("message content should normalize");
+
+        assert_eq!(
+            event,
+            ModelResponseEvent::ModelText("Local Gemma response".to_string())
+        );
+    }
+
+    #[test]
+    fn openai_response_normalization_detects_disabled_tool_calls() {
+        let body = r#"{
+          "choices": [
+            {
+              "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [
+                  {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                      "name": "web_search",
+                      "arguments": "{}"
+                    }
+                  }
+                ]
+              }
+            }
+          ]
+        }"#;
+
+        let event = normalize_openai_response(body).expect("tool call should be detected");
+
+        assert_eq!(
+            event,
+            ModelResponseEvent::ToolCallRequested {
+                approval_required: UserApprovalState::Required,
+            }
+        );
+    }
+
+    #[test]
+    fn openai_response_normalization_prioritizes_tool_calls_over_content() {
+        let body = r#"{
+          "choices": [
+            {
+              "message": {
+                "role": "assistant",
+                "content": "Do not treat this as final text.",
+                "tool_calls": [
+                  {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                      "name": "local_workspace_query",
+                      "arguments": "{}"
+                    }
+                  }
+                ]
+              }
+            }
+          ]
+        }"#;
+
+        let event = normalize_openai_response(body).expect("tool call should be detected first");
+
+        assert_eq!(
+            event,
+            ModelResponseEvent::ToolCallRequested {
+                approval_required: UserApprovalState::Required,
+            }
+        );
+    }
+
+    #[test]
+    fn openai_response_normalization_returns_controlled_error_for_malformed_or_empty_response() {
+        let malformed = normalize_openai_response("{");
+        let empty = normalize_openai_response(r#"{ "choices": [] }"#);
+
+        assert!(malformed.is_err());
+        assert!(empty.is_err());
+    }
+
+    #[test]
+    fn short_response_snippet_truncates_unicode_on_char_boundaries() {
+        let body = "語 ".repeat(300);
+
+        let snippet = short_response_snippet(&body);
+
+        assert!(snippet.ends_with("..."));
+        assert!(snippet.chars().count() <= 243);
+    }
 }
