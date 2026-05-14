@@ -58,6 +58,27 @@ export interface ActiveModelIdentity {
   detail: string | null;
 }
 
+export type RuntimeConfigSource = 'session' | 'environment' | 'missing';
+
+export interface RuntimeConfigInput {
+  endpoint: string;
+  model: string;
+  profile_id: string | null;
+}
+
+export interface RuntimeConfigStatus {
+  source: RuntimeConfigSource;
+  valid: boolean;
+  status: ActiveModelIdentityStatus;
+  display_name: string;
+  profile_id: string | null;
+  endpoint_configured: boolean;
+  model_configured: boolean;
+  profile_known: boolean;
+  sanitized_endpoint_label: string | null;
+  detail: string | null;
+}
+
 export interface LocalGemmaUpdate {
   run_id: string;
   delta: string;

@@ -54,3 +54,29 @@ export const activeModelIdentitySchema = z.object({
   profile_known: z.boolean(),
   detail: z.string().nullable(),
 });
+
+export const runtimeConfigInputSchema = z.object({
+  endpoint: z.string(),
+  model: z.string(),
+  profile_id: z.string().nullable(),
+});
+
+export const runtimeConfigStatusSchema = z.object({
+  source: z.enum(['session', 'environment', 'missing']),
+  valid: z.boolean(),
+  status: z.enum([
+    'configured',
+    'missing_endpoint',
+    'missing_model',
+    'missing_profile',
+    'unknown_profile',
+    'invalid_endpoint',
+  ]),
+  display_name: z.string(),
+  profile_id: z.string().nullable(),
+  endpoint_configured: z.boolean(),
+  model_configured: z.boolean(),
+  profile_known: z.boolean(),
+  sanitized_endpoint_label: z.string().nullable(),
+  detail: z.string().nullable(),
+});

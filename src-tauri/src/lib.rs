@@ -1,11 +1,12 @@
 use std::path::PathBuf;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use chrono::Utc;
 use reqwest::{Client, Url};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Emitter, Manager, State};
 use uuid::Uuid;
 
 const LOCAL_GEMMA_TEMPERATURE: f32 = 0.2;
@@ -26,6 +27,13 @@ CREATE VIRTUAL TABLE IF NOT EXISTS vector_memory USING vec0(
 struct ExecuteLocalGemmaRequest {
     prompt: String,
     scalpel_context: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct RuntimeConfigInput {
+    endpoint: String,
+    model: String,
+    profile_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -72,6 +80,28 @@ struct ActiveModelIdentity {
     endpoint_configured: bool,
     model_configured: bool,
     profile_known: bool,
+    detail: Option<String>,
+}
+
+#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum RuntimeConfigSource {
+    Session,
+    Environment,
+    Missing,
+}
+
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+struct RuntimeConfigStatus {
+    source: RuntimeConfigSource,
+    valid: bool,
+    status: ActiveModelIdentityStatus,
+    display_name: String,
+    profile_id: Option<String>,
+    endpoint_configured: bool,
+    model_configured: bool,
+    profile_known: bool,
+    sanitized_endpoint_label: Option<String>,
     detail: Option<String>,
 }
 
@@ -132,6 +162,26 @@ struct LocalGemmaConfig {
     model: String,
     profile: Option<ModelCapabilityProfile>,
     timeout: Duration,
+}
+
+#[derive(Debug, Default)]
+struct RuntimeConfigState {
+    session_config: Mutex<Option<AppliedRuntimeConfig>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AppliedRuntimeConfig {
+    endpoint: String,
+    model: String,
+    profile_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EffectiveRuntimeConfigValues {
+    source: RuntimeConfigSource,
+    endpoint: Option<String>,
+    model: Option<String>,
+    profile_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -331,12 +381,52 @@ async fn dispatch_deep_research(
 }
 
 #[tauri::command]
-fn get_active_model_identity() -> ActiveModelIdentity {
-    active_model_identity_from_env()
+fn get_active_model_identity(runtime_config: State<'_, RuntimeConfigState>) -> ActiveModelIdentity {
+    active_model_identity_from_values(effective_runtime_config_values(&runtime_config))
+}
+
+#[tauri::command]
+fn get_runtime_config_status(runtime_config: State<'_, RuntimeConfigState>) -> RuntimeConfigStatus {
+    runtime_config_status_from_values(effective_runtime_config_values(&runtime_config))
+}
+
+#[tauri::command]
+fn validate_runtime_config(payload: RuntimeConfigInput) -> RuntimeConfigStatus {
+    runtime_config_status_from_input(&payload)
+}
+
+#[tauri::command]
+fn apply_runtime_config(
+    runtime_config: State<'_, RuntimeConfigState>,
+    payload: RuntimeConfigInput,
+) -> RuntimeConfigStatus {
+    match runtime_config.session_config.lock() {
+        Ok(mut session_config) => {
+            let status = apply_runtime_config_to_session(&mut session_config, &payload);
+            let valid = status.valid;
+            drop(session_config);
+            if valid {
+                runtime_config_status_from_values(effective_runtime_config_values(&runtime_config))
+            } else {
+                status
+            }
+        }
+        Err(_) => runtime_config_status_from_input(&payload),
+    }
+}
+
+#[tauri::command]
+fn clear_runtime_config(runtime_config: State<'_, RuntimeConfigState>) -> RuntimeConfigStatus {
+    if let Ok(mut session_config) = runtime_config.session_config.lock() {
+        *session_config = None;
+    }
+
+    runtime_config_status_from_values(effective_runtime_config_values(&runtime_config))
 }
 
 pub fn run() {
     tauri::Builder::default()
+        .manage(RuntimeConfigState::default())
         .setup(|app| {
             if let Err(error) = initialize_vector_database(app.handle()) {
                 eprintln!("SQLite-vec initialization skipped: {error}");
@@ -346,14 +436,18 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             execute_local_gemma,
             dispatch_deep_research,
-            get_active_model_identity
+            get_active_model_identity,
+            get_runtime_config_status,
+            validate_runtime_config,
+            apply_runtime_config,
+            clear_runtime_config
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
 
 async fn run_local_gemma(app: AppHandle, run_id: String, payload: ExecuteLocalGemmaRequest) {
-    let config = match load_local_gemma_config() {
+    let config = match load_local_gemma_config(&app) {
         Ok(config) => config,
         Err(error) => {
             emit_local_error(&app, run_id, error);
@@ -457,21 +551,118 @@ async fn run_local_gemma(app: AppHandle, run_id: String, payload: ExecuteLocalGe
     }
 }
 
-fn load_local_gemma_config() -> Result<LocalGemmaConfig, String> {
-    let endpoint = required_env(
-        "AI_UNDERGROUND_GEMMA_ENDPOINT",
-        "Local model endpoint is not configured.",
-    )?;
-    let model = required_env(
-        "AI_UNDERGROUND_GEMMA_MODEL",
-        "Local model id is not configured.",
-    )?;
-    let endpoint = validate_local_model_endpoint(&endpoint)?;
-    let profile = match std::env::var("AI_UNDERGROUND_GEMMA_PROFILE")
+fn load_local_gemma_config(app: &AppHandle) -> Result<LocalGemmaConfig, String> {
+    let runtime_config = app.state::<RuntimeConfigState>();
+    local_gemma_config_from_values(effective_runtime_config_values(&runtime_config))
+}
+
+fn optional_env(key: &str) -> Option<String> {
+    std::env::var(key)
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-    {
+}
+
+fn effective_runtime_config_values(
+    runtime_config: &RuntimeConfigState,
+) -> EffectiveRuntimeConfigValues {
+    effective_runtime_config_values_from_parts(
+        runtime_config
+            .session_config
+            .lock()
+            .ok()
+            .and_then(|session_config| session_config.clone()),
+        environment_runtime_config_values(),
+    )
+}
+
+fn environment_runtime_config_values() -> EffectiveRuntimeConfigValues {
+    let endpoint = optional_env("AI_UNDERGROUND_GEMMA_ENDPOINT");
+    let model = optional_env("AI_UNDERGROUND_GEMMA_MODEL");
+    let profile_id = optional_env("AI_UNDERGROUND_GEMMA_PROFILE");
+    let source = if endpoint.is_some() || model.is_some() || profile_id.is_some() {
+        RuntimeConfigSource::Environment
+    } else {
+        RuntimeConfigSource::Missing
+    };
+
+    EffectiveRuntimeConfigValues {
+        source,
+        endpoint,
+        model,
+        profile_id,
+    }
+}
+
+fn effective_runtime_config_values_from_parts(
+    session_config: Option<AppliedRuntimeConfig>,
+    environment_config: EffectiveRuntimeConfigValues,
+) -> EffectiveRuntimeConfigValues {
+    match session_config {
+        Some(config) => EffectiveRuntimeConfigValues {
+            source: RuntimeConfigSource::Session,
+            endpoint: Some(config.endpoint),
+            model: Some(config.model),
+            profile_id: config.profile_id,
+        },
+        None => environment_config,
+    }
+}
+
+fn runtime_config_values_from_input(input: &RuntimeConfigInput) -> EffectiveRuntimeConfigValues {
+    EffectiveRuntimeConfigValues {
+        source: RuntimeConfigSource::Session,
+        endpoint: trimmed_optional(&input.endpoint),
+        model: trimmed_optional(&input.model),
+        profile_id: input.profile_id.as_deref().and_then(trimmed_optional),
+    }
+}
+
+fn trimmed_optional(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn applied_runtime_config_from_input(input: &RuntimeConfigInput) -> Option<AppliedRuntimeConfig> {
+    let values = runtime_config_values_from_input(input);
+    Some(AppliedRuntimeConfig {
+        endpoint: values.endpoint?,
+        model: values.model?,
+        profile_id: values.profile_id,
+    })
+}
+
+fn apply_runtime_config_to_session(
+    session_config: &mut Option<AppliedRuntimeConfig>,
+    input: &RuntimeConfigInput,
+) -> RuntimeConfigStatus {
+    let status = runtime_config_status_from_input(input);
+    if !status.valid {
+        return status;
+    }
+
+    if let Some(applied) = applied_runtime_config_from_input(input) {
+        *session_config = Some(applied);
+    }
+
+    status
+}
+
+fn local_gemma_config_from_values(
+    values: EffectiveRuntimeConfigValues,
+) -> Result<LocalGemmaConfig, String> {
+    let endpoint = values
+        .endpoint
+        .ok_or_else(|| "Local model endpoint is not configured.".to_string())?;
+    let model = values
+        .model
+        .ok_or_else(|| "Local model id is not configured.".to_string())?;
+    let endpoint = validate_local_model_endpoint(&endpoint)?;
+    let profile = match values.profile_id {
         Some(profile_id) => Some(model_profile(&profile_id, &model)?),
         None => None,
     };
@@ -485,102 +676,185 @@ fn load_local_gemma_config() -> Result<LocalGemmaConfig, String> {
     })
 }
 
-fn required_env(key: &str, missing_message: &str) -> Result<String, String> {
-    std::env::var(key)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| missing_message.to_string())
-}
+fn active_model_identity_from_values(values: EffectiveRuntimeConfigValues) -> ActiveModelIdentity {
+    let status = runtime_config_status_from_values(values.clone());
 
-fn optional_env(key: &str) -> Option<String> {
-    std::env::var(key)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-}
-
-fn active_model_identity_from_env() -> ActiveModelIdentity {
-    active_model_identity_from_values(
-        optional_env("AI_UNDERGROUND_GEMMA_ENDPOINT"),
-        optional_env("AI_UNDERGROUND_GEMMA_MODEL"),
-        optional_env("AI_UNDERGROUND_GEMMA_PROFILE"),
-    )
-}
-
-fn active_model_identity_from_values(
-    endpoint: Option<String>,
-    model: Option<String>,
-    profile_id: Option<String>,
-) -> ActiveModelIdentity {
-    let endpoint_configured = endpoint.is_some();
-    let model_configured = model.is_some();
-
-    let Some(endpoint) = endpoint else {
+    if status.status != ActiveModelIdentityStatus::Configured {
         return inactive_model_identity(
+            status.status,
+            status.profile_id,
+            &status.display_name,
+            status.endpoint_configured,
+            status.model_configured,
+            status
+                .detail
+                .as_deref()
+                .unwrap_or("Local model is not configured."),
+        );
+    }
+
+    match (values.profile_id, values.model) {
+        (Some(profile_id), Some(model)) => match model_profile(&profile_id, &model) {
+            Ok(profile) => ActiveModelIdentity {
+                status: ActiveModelIdentityStatus::Configured,
+                profile_id: Some(profile.profile_id.to_string()),
+                display_name: profile.display_name.to_string(),
+                runtime_label: "OpenAI-compatible local runtime".to_string(),
+                runtime_model_id: Some(profile.runtime_model_id),
+                endpoint_configured: status.endpoint_configured,
+                model_configured: status.model_configured,
+                profile_known: true,
+                detail: None,
+            },
+            Err(_) => inactive_model_identity(
+                ActiveModelIdentityStatus::UnknownProfile,
+                Some(profile_id),
+                "Unknown Profile",
+                status.endpoint_configured,
+                status.model_configured,
+                "Configured local model profile is not recognized.",
+            ),
+        },
+        _ => inactive_model_identity(
+            ActiveModelIdentityStatus::MissingProfile,
+            None,
+            "Profile Not Set",
+            status.endpoint_configured,
+            status.model_configured,
+            "Select a local model profile.",
+        ),
+    }
+}
+
+fn runtime_config_status_from_input(input: &RuntimeConfigInput) -> RuntimeConfigStatus {
+    runtime_config_status_from_values(runtime_config_values_from_input(input))
+}
+
+fn runtime_config_status_from_values(values: EffectiveRuntimeConfigValues) -> RuntimeConfigStatus {
+    let endpoint_configured = values.endpoint.is_some();
+    let model_configured = values.model.is_some();
+    let sanitized_endpoint_label = sanitized_endpoint_label(values.endpoint.as_deref());
+
+    let Some(endpoint) = values.endpoint else {
+        return runtime_config_status(
+            values.source,
             ActiveModelIdentityStatus::MissingEndpoint,
-            profile_id,
             "Not Configured",
+            values.profile_id,
             endpoint_configured,
             model_configured,
-            "Local model endpoint is not configured.",
+            false,
+            sanitized_endpoint_label,
+            "Local runtime endpoint is not configured.",
         );
     };
 
-    let Some(model) = model else {
-        return inactive_model_identity(
+    let Some(model) = values.model else {
+        return runtime_config_status(
+            values.source,
             ActiveModelIdentityStatus::MissingModel,
-            profile_id,
             "Not Configured",
+            values.profile_id,
             endpoint_configured,
             model_configured,
-            "Local model id is not configured.",
+            false,
+            sanitized_endpoint_label,
+            "Model ID is not configured.",
         );
     };
 
     if validate_local_model_endpoint(&endpoint).is_err() {
-        return inactive_model_identity(
+        return runtime_config_status(
+            values.source,
             ActiveModelIdentityStatus::InvalidEndpoint,
-            profile_id,
             "Endpoint Blocked",
+            values.profile_id,
             endpoint_configured,
             model_configured,
+            false,
+            sanitized_endpoint_label,
             "Endpoint must be localhost and target /v1/chat/completions.",
         );
     }
 
-    let Some(profile_id) = profile_id else {
-        return inactive_model_identity(
+    let Some(profile_id) = values.profile_id else {
+        return runtime_config_status(
+            values.source,
             ActiveModelIdentityStatus::MissingProfile,
-            None,
             "Profile Not Set",
+            None,
             endpoint_configured,
             model_configured,
-            "Set AI_UNDERGROUND_GEMMA_PROFILE to show a verified local model profile.",
+            false,
+            sanitized_endpoint_label,
+            "Select a local model profile.",
         );
     };
 
     match model_profile(&profile_id, &model) {
-        Ok(profile) => ActiveModelIdentity {
+        Ok(profile) => RuntimeConfigStatus {
+            source: values.source,
+            valid: true,
             status: ActiveModelIdentityStatus::Configured,
             profile_id: Some(profile.profile_id.to_string()),
             display_name: profile.display_name.to_string(),
-            runtime_label: "OpenAI-compatible local runtime".to_string(),
-            runtime_model_id: Some(profile.runtime_model_id),
             endpoint_configured,
             model_configured,
             profile_known: true,
+            sanitized_endpoint_label,
             detail: None,
         },
-        Err(_) => inactive_model_identity(
+        Err(_) => runtime_config_status(
+            values.source,
             ActiveModelIdentityStatus::UnknownProfile,
-            Some(profile_id),
             "Unknown Profile",
+            Some(profile_id),
             endpoint_configured,
             model_configured,
+            false,
+            sanitized_endpoint_label,
             "Configured local model profile is not recognized.",
         ),
     }
+}
+
+fn runtime_config_status(
+    source: RuntimeConfigSource,
+    status: ActiveModelIdentityStatus,
+    display_name: &str,
+    profile_id: Option<String>,
+    endpoint_configured: bool,
+    model_configured: bool,
+    profile_known: bool,
+    sanitized_endpoint_label: Option<String>,
+    detail: &str,
+) -> RuntimeConfigStatus {
+    RuntimeConfigStatus {
+        source,
+        valid: false,
+        status,
+        display_name: display_name.to_string(),
+        profile_id,
+        endpoint_configured,
+        model_configured,
+        profile_known,
+        sanitized_endpoint_label,
+        detail: Some(detail.to_string()),
+    }
+}
+
+fn sanitized_endpoint_label(endpoint: Option<&str>) -> Option<String> {
+    endpoint.map(
+        |raw_endpoint| match validate_local_model_endpoint(raw_endpoint) {
+            Ok(endpoint) => match endpoint.host_str() {
+                Some("localhost") => "localhost".to_string(),
+                Some("127.0.0.1") => "127.0.0.1".to_string(),
+                Some("::1") | Some("[::1]") => "[::1]".to_string(),
+                _ => "local endpoint configured".to_string(),
+            },
+            Err(_) => "local endpoint rejected".to_string(),
+        },
+    )
 }
 
 fn inactive_model_identity(
@@ -1131,6 +1405,20 @@ fn emit_research_update(app: &AppHandle, payload: ResearchUpdate) {
 mod tests {
     use super::*;
 
+    fn test_values(
+        source: RuntimeConfigSource,
+        endpoint: Option<&str>,
+        model: Option<&str>,
+        profile_id: Option<&str>,
+    ) -> EffectiveRuntimeConfigValues {
+        EffectiveRuntimeConfigValues {
+            source,
+            endpoint: endpoint.map(str::to_string),
+            model: model.map(str::to_string),
+            profile_id: profile_id.map(str::to_string),
+        }
+    }
+
     #[test]
     fn local_endpoint_validation_accepts_localhost() {
         let endpoint = validate_local_model_endpoint("http://localhost:1234/v1/chat/completions")
@@ -1311,11 +1599,12 @@ mod tests {
 
     #[test]
     fn active_identity_returns_unknown_profile_state() {
-        let identity = active_model_identity_from_values(
-            Some("http://127.0.0.1:1234/v1/chat/completions".to_string()),
-            Some("google/gemma-4-31b".to_string()),
-            Some("unknown-profile".to_string()),
-        );
+        let identity = active_model_identity_from_values(test_values(
+            RuntimeConfigSource::Session,
+            Some("http://127.0.0.1:1234/v1/chat/completions"),
+            Some("google/gemma-4-31b"),
+            Some("unknown-profile"),
+        ));
 
         assert_eq!(identity.status, ActiveModelIdentityStatus::UnknownProfile);
         assert_eq!(identity.display_name, "Unknown Profile");
@@ -1325,11 +1614,12 @@ mod tests {
 
     #[test]
     fn active_identity_returns_missing_profile_state() {
-        let identity = active_model_identity_from_values(
-            Some("http://127.0.0.1:1234/v1/chat/completions".to_string()),
-            Some("google/gemma-4-31b".to_string()),
+        let identity = active_model_identity_from_values(test_values(
+            RuntimeConfigSource::Session,
+            Some("http://127.0.0.1:1234/v1/chat/completions"),
+            Some("google/gemma-4-31b"),
             None,
-        );
+        ));
 
         assert_eq!(identity.status, ActiveModelIdentityStatus::MissingProfile);
         assert_eq!(identity.display_name, "Profile Not Set");
@@ -1339,11 +1629,12 @@ mod tests {
 
     #[test]
     fn active_identity_returns_missing_endpoint_state() {
-        let identity = active_model_identity_from_values(
+        let identity = active_model_identity_from_values(test_values(
+            RuntimeConfigSource::Missing,
             None,
-            Some("google/gemma-4-31b".to_string()),
-            Some("gemma4-31b".to_string()),
-        );
+            Some("google/gemma-4-31b"),
+            Some("gemma4-31b"),
+        ));
 
         assert_eq!(identity.status, ActiveModelIdentityStatus::MissingEndpoint);
         assert_eq!(identity.display_name, "Not Configured");
@@ -1354,11 +1645,12 @@ mod tests {
 
     #[test]
     fn active_identity_returns_missing_model_state() {
-        let identity = active_model_identity_from_values(
-            Some("http://127.0.0.1:1234/v1/chat/completions".to_string()),
+        let identity = active_model_identity_from_values(test_values(
+            RuntimeConfigSource::Environment,
+            Some("http://127.0.0.1:1234/v1/chat/completions"),
             None,
-            Some("gemma4-31b".to_string()),
-        );
+            Some("gemma4-31b"),
+        ));
 
         assert_eq!(identity.status, ActiveModelIdentityStatus::MissingModel);
         assert_eq!(identity.display_name, "Not Configured");
@@ -1370,11 +1662,12 @@ mod tests {
     #[test]
     fn active_identity_does_not_expose_invalid_endpoint_value() {
         let remote_endpoint = "http://example.com/v1/chat/completions";
-        let identity = active_model_identity_from_values(
-            Some(remote_endpoint.to_string()),
-            Some("google/gemma-4-31b".to_string()),
-            Some("gemma4-31b".to_string()),
-        );
+        let identity = active_model_identity_from_values(test_values(
+            RuntimeConfigSource::Session,
+            Some(remote_endpoint),
+            Some("google/gemma-4-31b"),
+            Some("gemma4-31b"),
+        ));
 
         assert_eq!(identity.status, ActiveModelIdentityStatus::InvalidEndpoint);
         assert_eq!(identity.display_name, "Endpoint Blocked");
@@ -1387,11 +1680,12 @@ mod tests {
 
     #[test]
     fn active_identity_returns_configured_profile_state() {
-        let identity = active_model_identity_from_values(
-            Some("http://localhost:1234/v1/chat/completions".to_string()),
-            Some("google/gemma-4-31b".to_string()),
-            Some("gemma4-31b".to_string()),
-        );
+        let identity = active_model_identity_from_values(test_values(
+            RuntimeConfigSource::Session,
+            Some("http://localhost:1234/v1/chat/completions"),
+            Some("google/gemma-4-31b"),
+            Some("gemma4-31b"),
+        ));
 
         assert_eq!(identity.status, ActiveModelIdentityStatus::Configured);
         assert_eq!(identity.display_name, "Gemma4-31B Dense");
@@ -1401,5 +1695,113 @@ mod tests {
             Some("google/gemma-4-31b".to_string())
         );
         assert!(identity.profile_known);
+    }
+
+    #[test]
+    fn session_config_overrides_environment_config() {
+        let session = Some(AppliedRuntimeConfig {
+            endpoint: "http://localhost:1234/v1/chat/completions".to_string(),
+            model: "session-model".to_string(),
+            profile_id: Some("gemma4-31b".to_string()),
+        });
+        let environment = test_values(
+            RuntimeConfigSource::Environment,
+            Some("http://127.0.0.1:9999/v1/chat/completions"),
+            Some("environment-model"),
+            Some("gemma4-26b-a4b"),
+        );
+
+        let effective = effective_runtime_config_values_from_parts(session, environment);
+
+        assert_eq!(effective.source, RuntimeConfigSource::Session);
+        assert_eq!(effective.model, Some("session-model".to_string()));
+        assert_eq!(effective.profile_id, Some("gemma4-31b".to_string()));
+    }
+
+    #[test]
+    fn environment_config_is_fallback_without_session_config() {
+        let environment = test_values(
+            RuntimeConfigSource::Environment,
+            Some("http://127.0.0.1:1234/v1/chat/completions"),
+            Some("environment-model"),
+            Some("gemma4-26b-a4b"),
+        );
+
+        let effective = effective_runtime_config_values_from_parts(None, environment);
+
+        assert_eq!(effective.source, RuntimeConfigSource::Environment);
+        assert_eq!(effective.model, Some("environment-model".to_string()));
+    }
+
+    #[test]
+    fn clear_session_config_returns_to_environment_fallback_or_missing_state() {
+        let environment = test_values(RuntimeConfigSource::Missing, None, None, None);
+
+        let effective = effective_runtime_config_values_from_parts(None, environment);
+        let status = runtime_config_status_from_values(effective);
+
+        assert_eq!(status.source, RuntimeConfigSource::Missing);
+        assert_eq!(status.status, ActiveModelIdentityStatus::MissingEndpoint);
+        assert!(!status.valid);
+    }
+
+    #[test]
+    fn invalid_endpoint_is_rejected_and_not_applied() {
+        let input = RuntimeConfigInput {
+            endpoint: "http://example.com/v1/chat/completions".to_string(),
+            model: "google/gemma-4-31b".to_string(),
+            profile_id: Some("gemma4-31b".to_string()),
+        };
+        let mut session_config = Some(AppliedRuntimeConfig {
+            endpoint: "http://localhost:1234/v1/chat/completions".to_string(),
+            model: "existing-model".to_string(),
+            profile_id: Some("gemma4-31b".to_string()),
+        });
+
+        let status = apply_runtime_config_to_session(&mut session_config, &input);
+
+        assert_eq!(status.status, ActiveModelIdentityStatus::InvalidEndpoint);
+        assert!(!status.valid);
+        assert_eq!(
+            session_config.as_ref().map(|config| config.model.as_str()),
+            Some("existing-model")
+        );
+    }
+
+    #[test]
+    fn invalid_endpoint_status_does_not_expose_raw_endpoint() {
+        let raw_endpoint = "http://example.com/v1/chat/completions";
+        let status = runtime_config_status_from_values(test_values(
+            RuntimeConfigSource::Session,
+            Some(raw_endpoint),
+            Some("google/gemma-4-31b"),
+            Some("gemma4-31b"),
+        ));
+
+        assert_eq!(status.status, ActiveModelIdentityStatus::InvalidEndpoint);
+        assert_ne!(status.detail.as_deref(), Some(raw_endpoint));
+        assert!(!status.detail.unwrap_or_default().contains(raw_endpoint));
+        assert_eq!(
+            status.sanitized_endpoint_label,
+            Some("local endpoint rejected".to_string())
+        );
+    }
+
+    #[test]
+    fn local_gemma_config_uses_effective_config_values() {
+        let config = local_gemma_config_from_values(test_values(
+            RuntimeConfigSource::Session,
+            Some("http://127.0.0.1:1234/v1/chat/completions"),
+            Some("session-model"),
+            Some("gemma4-31b"),
+        ))
+        .expect("effective config should load");
+
+        assert_eq!(config.model, "session-model");
+        assert_eq!(config.endpoint.host_str(), Some("127.0.0.1"));
+        assert_eq!(
+            config.profile.as_ref().map(|profile| profile.profile_id),
+            Some("gemma4-31b")
+        );
     }
 }

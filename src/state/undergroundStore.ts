@@ -1,8 +1,16 @@
 import { create } from 'zustand';
-import type { ActiveModelIdentity, ResearchTask, ResearchUpdate, TacticalMessage } from '../domain/types';
+import type {
+  ActiveModelIdentity,
+  ResearchTask,
+  ResearchUpdate,
+  RuntimeConfigInput,
+  RuntimeConfigStatus,
+  TacticalMessage,
+} from '../domain/types';
 import { extractThoughtSummary } from '../domain/parsers';
 
 type ActiveModelIdentityLoadStatus = 'idle' | 'loading' | 'ready' | 'error';
+type RuntimeConfigLoadStatus = 'idle' | 'loading' | 'ready' | 'error';
 
 interface UndergroundState {
   local_tactical_stream: TacticalMessage[];
@@ -11,6 +19,12 @@ interface UndergroundState {
   active_model_identity: ActiveModelIdentity | null;
   active_model_identity_status: ActiveModelIdentityLoadStatus;
   active_model_identity_error: string | null;
+  runtime_config_panel_open: boolean;
+  runtime_config_draft: RuntimeConfigInput;
+  runtime_config_status: RuntimeConfigStatus | null;
+  runtime_config_validation: RuntimeConfigStatus | null;
+  runtime_config_load_status: RuntimeConfigLoadStatus;
+  runtime_config_error: string | null;
   addUserMessage: (content: string) => void;
   startLocalModelMessage: (id: string) => void;
   startResearchModelMessage: (taskId: string, query: string) => void;
@@ -22,6 +36,13 @@ interface UndergroundState {
   setActiveModelIdentityLoading: () => void;
   setActiveModelIdentity: (identity: ActiveModelIdentity) => void;
   failActiveModelIdentity: (error: string) => void;
+  setRuntimeConfigPanelOpen: (open: boolean) => void;
+  setRuntimeConfigDraft: (draft: RuntimeConfigInput) => void;
+  updateRuntimeConfigDraft: (patch: Partial<RuntimeConfigInput>) => void;
+  setRuntimeConfigLoading: () => void;
+  setRuntimeConfigStatus: (status: RuntimeConfigStatus) => void;
+  setRuntimeConfigValidation: (status: RuntimeConfigStatus) => void;
+  failRuntimeConfig: (error: string) => void;
 }
 
 export const useUndergroundStore = create<UndergroundState>((set) => ({
@@ -31,6 +52,16 @@ export const useUndergroundStore = create<UndergroundState>((set) => ({
   active_model_identity: null,
   active_model_identity_status: 'idle',
   active_model_identity_error: null,
+  runtime_config_panel_open: false,
+  runtime_config_draft: {
+    endpoint: '',
+    model: '',
+    profile_id: 'gemma4-31b',
+  },
+  runtime_config_status: null,
+  runtime_config_validation: null,
+  runtime_config_load_status: 'idle',
+  runtime_config_error: null,
 
   addUserMessage: (content) =>
     set((state) => ({
@@ -175,6 +206,54 @@ export const useUndergroundStore = create<UndergroundState>((set) => ({
       active_model_identity: null,
       active_model_identity_status: 'error',
       active_model_identity_error: error,
+    }),
+
+  setRuntimeConfigPanelOpen: (open) =>
+    set({
+      runtime_config_panel_open: open,
+    }),
+
+  setRuntimeConfigDraft: (draft) =>
+    set({
+      runtime_config_draft: draft,
+      runtime_config_validation: null,
+      runtime_config_error: null,
+    }),
+
+  updateRuntimeConfigDraft: (patch) =>
+    set((state) => ({
+      runtime_config_draft: {
+        ...state.runtime_config_draft,
+        ...patch,
+      },
+      runtime_config_validation: null,
+      runtime_config_error: null,
+    })),
+
+  setRuntimeConfigLoading: () =>
+    set({
+      runtime_config_load_status: 'loading',
+      runtime_config_error: null,
+    }),
+
+  setRuntimeConfigStatus: (status) =>
+    set({
+      runtime_config_status: status,
+      runtime_config_load_status: 'ready',
+      runtime_config_error: null,
+    }),
+
+  setRuntimeConfigValidation: (status) =>
+    set({
+      runtime_config_validation: status,
+      runtime_config_load_status: 'ready',
+      runtime_config_error: null,
+    }),
+
+  failRuntimeConfig: (error) =>
+    set({
+      runtime_config_load_status: 'error',
+      runtime_config_error: error,
     }),
 }));
 

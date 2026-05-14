@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   Activity,
   ChevronDown,
@@ -11,8 +11,17 @@ import {
   ShieldAlert,
   Sparkles,
   Terminal,
+  X,
 } from 'lucide-react';
-import { dispatchDeepResearch, executeLocalGemma, getActiveModelIdentity } from './ipc/tauriCommands';
+import {
+  applyRuntimeConfig,
+  clearRuntimeConfig,
+  dispatchDeepResearch,
+  executeLocalGemma,
+  getActiveModelIdentity,
+  getRuntimeConfigStatus,
+  validateRuntimeConfig,
+} from './ipc/tauriCommands';
 import { registerTauriEventHandlers } from './ipc/tauriEvents';
 import { parseResearchCommand } from './domain/parsers';
 import { useUndergroundStore } from './state/undergroundStore';
@@ -20,8 +29,22 @@ import type {
   ActiveModelIdentity,
   DispatchDeepResearchPayload,
   ExecuteLocalGemmaPayload,
+  RuntimeConfigInput,
+  RuntimeConfigStatus,
   TacticalMessage,
 } from './domain/types';
+
+const MODEL_PROFILE_OPTIONS = [
+  { id: 'gemma4-26b-a4b', label: 'Gemma4-26B-MoE' },
+  { id: 'gemma4-31b', label: 'Gemma4-31B Dense' },
+  { id: 'supergemma4-26b-uncensored', label: 'Gemma4-26B-Uncensored' },
+];
+
+const LM_STUDIO_LOCAL_DEFAULT: RuntimeConfigInput = {
+  endpoint: 'http://127.0.0.1:1234/v1/chat/completions',
+  model: 'google/gemma-4-31b',
+  profile_id: 'gemma4-31b',
+};
 
 export default function App() {
   const [tacticalInput, setTacticalInput] = useState('');
@@ -34,6 +57,12 @@ export default function App() {
     active_model_identity,
     active_model_identity_status,
     active_model_identity_error,
+    runtime_config_panel_open,
+    runtime_config_draft,
+    runtime_config_status,
+    runtime_config_validation,
+    runtime_config_load_status,
+    runtime_config_error,
     addUserMessage,
     startLocalModelMessage,
     startResearchModelMessage,
@@ -42,7 +71,46 @@ export default function App() {
     setActiveModelIdentityLoading,
     setActiveModelIdentity,
     failActiveModelIdentity,
+    setRuntimeConfigPanelOpen,
+    updateRuntimeConfigDraft,
+    setRuntimeConfigLoading,
+    setRuntimeConfigStatus,
+    setRuntimeConfigValidation,
+    failRuntimeConfig,
   } = useUndergroundStore();
+
+  const refreshRuntimeState = useCallback(
+    async (isDisposed: () => boolean = () => false) => {
+      setActiveModelIdentityLoading();
+      setRuntimeConfigLoading();
+
+      try {
+        const [identity, status] = await Promise.all([getActiveModelIdentity(), getRuntimeConfigStatus()]);
+        if (isDisposed()) {
+          return;
+        }
+
+        setActiveModelIdentity(identity);
+        setRuntimeConfigStatus(status);
+      } catch (error) {
+        if (isDisposed()) {
+          return;
+        }
+
+        const message = normalizeError(error);
+        failActiveModelIdentity(message);
+        failRuntimeConfig(message);
+      }
+    },
+    [
+      failActiveModelIdentity,
+      failRuntimeConfig,
+      setActiveModelIdentity,
+      setActiveModelIdentityLoading,
+      setRuntimeConfigLoading,
+      setRuntimeConfigStatus,
+    ],
+  );
 
   useEffect(() => {
     let disposed = false;
@@ -81,27 +149,12 @@ export default function App() {
   useEffect(() => {
     let disposed = false;
 
-    setActiveModelIdentityLoading();
-    getActiveModelIdentity()
-      .then((identity) => {
-        if (disposed) {
-          return;
-        }
-
-        setActiveModelIdentity(identity);
-      })
-      .catch((error) => {
-        if (disposed) {
-          return;
-        }
-
-        failActiveModelIdentity(normalizeError(error));
-      });
+    void refreshRuntimeState(() => disposed);
 
     return () => {
       disposed = true;
     };
-  }, [failActiveModelIdentity, setActiveModelIdentity, setActiveModelIdentityLoading]);
+  }, [refreshRuntimeState]);
 
   const activeResearchTask = useMemo(
     () => cloud_research_queue.find((task) => task.status === 'running' || task.status === 'queued') ?? null,
@@ -171,6 +224,43 @@ export default function App() {
     }
   };
 
+  const handleValidateRuntimeConfig = async () => {
+    setRuntimeConfigLoading();
+    try {
+      const status = await validateRuntimeConfig(runtime_config_draft);
+      setRuntimeConfigValidation(status);
+    } catch (error) {
+      failRuntimeConfig(normalizeError(error));
+    }
+  };
+
+  const handleApplyRuntimeConfig = async () => {
+    setRuntimeConfigLoading();
+    try {
+      const status = await applyRuntimeConfig(runtime_config_draft);
+      setRuntimeConfigStatus(status);
+      setRuntimeConfigValidation(status);
+      if (status.valid) {
+        await refreshRuntimeState();
+        setRuntimeConfigPanelOpen(false);
+      }
+    } catch (error) {
+      failRuntimeConfig(normalizeError(error));
+    }
+  };
+
+  const handleClearRuntimeConfig = async () => {
+    setRuntimeConfigLoading();
+    try {
+      const status = await clearRuntimeConfig();
+      setRuntimeConfigStatus(status);
+      setRuntimeConfigValidation(status);
+      await refreshRuntimeState();
+    } catch (error) {
+      failRuntimeConfig(normalizeError(error));
+    }
+  };
+
   return (
     <div className="relative flex h-screen w-full gap-4 overflow-hidden bg-[#030305] p-4 font-mono text-sm text-[#a1a1aa] selection:bg-[#20bd90] selection:text-black">
       <div className="pointer-events-none absolute left-[-10%] top-[-20%] h-[60%] w-[60%] rounded-full bg-[#20bd90] opacity-10 blur-[180px] mix-blend-screen" />
@@ -180,7 +270,7 @@ export default function App() {
 
       <main className="relative z-10 flex h-full w-2/4 flex-col overflow-hidden rounded-3xl border border-white/[0.05] bg-white/[0.015] shadow-2xl backdrop-blur-2xl">
         <div className="z-20 flex items-center justify-between border-b border-white/[0.05] bg-black/20 p-5">
-          <div className="flex items-center gap-3">
+          <div className="relative flex items-center gap-3">
             <span className="text-[10px] font-semibold uppercase tracking-widest text-white">Central Command</span>
             <span className="rounded border border-[#20bd90]/20 bg-[#20bd90]/10 px-2 py-0.5 text-[9px] font-bold tracking-wide text-[#20bd90]">
               Explicit Routing
@@ -189,7 +279,23 @@ export default function App() {
               identity={active_model_identity}
               status={active_model_identity_status}
               error={active_model_identity_error}
+              onClick={() => setRuntimeConfigPanelOpen(!runtime_config_panel_open)}
             />
+            {runtime_config_panel_open && (
+              <RuntimeConfigPanel
+                draft={runtime_config_draft}
+                status={runtime_config_status}
+                validation={runtime_config_validation}
+                loadStatus={runtime_config_load_status}
+                error={runtime_config_error}
+                onDraftChange={updateRuntimeConfigDraft}
+                onUseDefault={() => updateRuntimeConfigDraft(LM_STUDIO_LOCAL_DEFAULT)}
+                onValidate={() => void handleValidateRuntimeConfig()}
+                onApply={() => void handleApplyRuntimeConfig()}
+                onClear={() => void handleClearRuntimeConfig()}
+                onClose={() => setRuntimeConfigPanelOpen(false)}
+              />
+            )}
           </div>
           <Sparkles size={14} className="text-white/40" />
         </div>
@@ -344,21 +450,202 @@ function ActiveModelBadge({
   identity,
   status,
   error,
+  onClick,
 }: {
   identity: ActiveModelIdentity | null;
   status: 'idle' | 'loading' | 'ready' | 'error';
   error: string | null;
+  onClick: () => void;
 }) {
   const label = activeModelLabel(identity, status);
   const detail = activeModelDetail(identity, error);
 
   return (
-    <span
+    <button
+      type="button"
       title={detail}
-      className="rounded border border-[#5994d7]/20 bg-[#5994d7]/10 px-2 py-0.5 text-[9px] font-bold tracking-wide text-[#e1f5f9]"
+      onClick={onClick}
+      className="rounded border border-[#5994d7]/20 bg-[#5994d7]/10 px-2 py-0.5 text-[9px] font-bold tracking-wide text-[#e1f5f9] transition-colors hover:border-[#5994d7]/40 hover:bg-[#5994d7]/20"
     >
       {label}
-    </span>
+    </button>
+  );
+}
+
+function RuntimeConfigPanel({
+  draft,
+  status,
+  validation,
+  loadStatus,
+  error,
+  onDraftChange,
+  onUseDefault,
+  onValidate,
+  onApply,
+  onClear,
+  onClose,
+}: {
+  draft: RuntimeConfigInput;
+  status: RuntimeConfigStatus | null;
+  validation: RuntimeConfigStatus | null;
+  loadStatus: 'idle' | 'loading' | 'ready' | 'error';
+  error: string | null;
+  onDraftChange: (patch: Partial<RuntimeConfigInput>) => void;
+  onUseDefault: () => void;
+  onValidate: () => void;
+  onApply: () => void;
+  onClear: () => void;
+  onClose: () => void;
+}) {
+  const feedback = validation ?? status;
+  const busy = loadStatus === 'loading';
+
+  return (
+    <div className="absolute left-0 top-8 z-50 w-[420px] rounded-2xl border border-white/10 bg-[#07070b]/95 p-4 shadow-2xl backdrop-blur-2xl">
+      <div className="mb-4 flex items-start justify-between gap-4">
+        <div>
+          <span className="block text-[10px] font-bold uppercase tracking-widest text-[#20bd90]">
+            Choose your local AI engine
+          </span>
+          <span className="mt-1 block text-[10px] uppercase tracking-wider text-white/40">Current session only</span>
+        </div>
+        <button
+          type="button"
+          aria-label="Close local runtime configuration"
+          onClick={onClose}
+          className="rounded-lg bg-white/5 p-1 text-white/40 transition-colors hover:text-white"
+        >
+          <X size={14} />
+        </button>
+      </div>
+
+      <div className="space-y-3">
+        <button
+          type="button"
+          disabled={busy}
+          onClick={onUseDefault}
+          className="w-full rounded-xl border border-[#20bd90]/25 bg-[#20bd90]/10 p-3 text-left transition-colors hover:border-[#20bd90]/45 hover:bg-[#20bd90]/15 disabled:opacity-50"
+        >
+          <span className="block text-xs font-bold text-[#e1f5f9]">Use LM Studio Local Default</span>
+          <span className="mt-1 block text-[10px] leading-relaxed text-white/45">
+            Fills the current-session settings for the standard local server.
+          </span>
+        </button>
+
+        <label className="block">
+          <span className="mb-1 block text-[10px] font-bold uppercase tracking-wider text-white/50">Model profile</span>
+          <select
+            value={draft.profile_id ?? ''}
+            onChange={(event) => onDraftChange({ profile_id: event.target.value || null })}
+            className="w-full rounded-xl border border-white/10 bg-black/50 px-3 py-2 text-xs text-[#e1f5f9] outline-none transition-colors focus:border-[#20bd90]/50"
+          >
+            <option value="">Profile Not Set</option>
+            {MODEL_PROFILE_OPTIONS.map((profile) => (
+              <option key={profile.id} value={profile.id}>
+                {profile.label}
+              </option>
+            ))}
+          </select>
+        </label>
+
+        <div className="rounded-xl border border-white/10 bg-black/30 p-3">
+          <span className="mb-3 block text-[10px] font-bold uppercase tracking-wider text-white/45">
+            Advanced Runtime Settings
+          </span>
+          <div className="space-y-3">
+            <RuntimeConfigField
+              label="Local runtime endpoint"
+              value={draft.endpoint}
+              placeholder="http://127.0.0.1:1234/v1/chat/completions"
+              onChange={(value) => onDraftChange({ endpoint: value })}
+            />
+            <RuntimeConfigField
+              label="Model ID"
+              value={draft.model}
+              placeholder="google/gemma-4-31b"
+              onChange={(value) => onDraftChange({ model: value })}
+            />
+          </div>
+        </div>
+      </div>
+
+      <div className="mt-4 flex flex-wrap items-center gap-2">
+        <button
+          type="button"
+          disabled={busy}
+          onClick={onValidate}
+          className="rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-[10px] font-bold uppercase tracking-wide text-white/70 transition-colors hover:bg-white/10 disabled:opacity-50"
+        >
+          Validate
+        </button>
+        <button
+          type="button"
+          disabled={busy}
+          onClick={onApply}
+          className="rounded-lg border border-[#20bd90]/30 bg-[#20bd90]/10 px-3 py-2 text-[10px] font-bold uppercase tracking-wide text-[#20bd90] transition-colors hover:bg-[#20bd90]/20 disabled:opacity-50"
+        >
+          Apply
+        </button>
+        <button
+          type="button"
+          disabled={busy}
+          onClick={onClear}
+          className="rounded-lg border border-white/10 bg-black/40 px-3 py-2 text-[10px] font-bold uppercase tracking-wide text-white/50 transition-colors hover:text-white disabled:opacity-50"
+        >
+          Clear Session Config
+        </button>
+      </div>
+
+      <div className="mt-4 rounded-xl border border-white/5 bg-black/40 p-3 text-xs leading-relaxed text-white/50">
+        {error ? (
+          <span className="text-[#fa3205]">{error}</span>
+        ) : feedback ? (
+          <RuntimeConfigFeedback status={feedback} />
+        ) : (
+          <span>Local Model: Checking</span>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function RuntimeConfigField({
+  label,
+  value,
+  placeholder,
+  onChange,
+}: {
+  label: string;
+  value: string;
+  placeholder: string;
+  onChange: (value: string) => void;
+}) {
+  return (
+    <label className="block">
+      <span className="mb-1 block text-[10px] font-bold uppercase tracking-wider text-white/50">{label}</span>
+      <input
+        value={value}
+        placeholder={placeholder}
+        onChange={(event) => onChange(event.target.value)}
+        className="w-full rounded-xl border border-white/10 bg-black/50 px-3 py-2 text-xs text-[#e1f5f9] outline-none transition-colors placeholder:text-white/25 focus:border-[#20bd90]/50"
+      />
+    </label>
+  );
+}
+
+function RuntimeConfigFeedback({ status }: { status: RuntimeConfigStatus }) {
+  const label = `Local Model: ${status.display_name}`;
+  const source = status.source === 'session' ? 'Session' : status.source === 'environment' ? 'Environment' : 'Missing';
+
+  return (
+    <div className="space-y-1">
+      <div className={status.valid ? 'text-[#20bd90]' : 'text-white/60'}>{label}</div>
+      <div className="text-[10px] uppercase tracking-wider text-white/35">
+        {source}
+        {status.sanitized_endpoint_label ? ` / ${status.sanitized_endpoint_label}` : ''}
+      </div>
+      {status.detail && <div>{status.detail}</div>}
+    </div>
   );
 }
 
