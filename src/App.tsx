@@ -15,6 +15,7 @@ import {
 } from 'lucide-react';
 import {
   applyRuntimeConfig,
+  clearSavedRuntimeConfig,
   clearRuntimeConfig,
   dispatchDeepResearch,
   executeLocalGemma,
@@ -261,6 +262,18 @@ export default function App() {
     }
   };
 
+  const handleClearSavedRuntimeConfig = async () => {
+    setRuntimeConfigLoading();
+    try {
+      const status = await clearSavedRuntimeConfig();
+      setRuntimeConfigStatus(status);
+      setRuntimeConfigValidation(status);
+      await refreshRuntimeState();
+    } catch (error) {
+      failRuntimeConfig(normalizeError(error));
+    }
+  };
+
   return (
     <div className="relative flex h-screen w-full gap-4 overflow-hidden bg-[#030305] p-4 font-mono text-sm text-[#a1a1aa] selection:bg-[#20bd90] selection:text-black">
       <div className="pointer-events-none absolute left-[-10%] top-[-20%] h-[60%] w-[60%] rounded-full bg-[#20bd90] opacity-10 blur-[180px] mix-blend-screen" />
@@ -293,6 +306,7 @@ export default function App() {
                 onValidate={() => void handleValidateRuntimeConfig()}
                 onApply={() => void handleApplyRuntimeConfig()}
                 onClear={() => void handleClearRuntimeConfig()}
+                onClearSaved={() => void handleClearSavedRuntimeConfig()}
                 onClose={() => setRuntimeConfigPanelOpen(false)}
               />
             )}
@@ -483,6 +497,7 @@ function RuntimeConfigPanel({
   onValidate,
   onApply,
   onClear,
+  onClearSaved,
   onClose,
 }: {
   draft: RuntimeConfigInput;
@@ -495,6 +510,7 @@ function RuntimeConfigPanel({
   onValidate: () => void;
   onApply: () => void;
   onClear: () => void;
+  onClearSaved: () => void;
   onClose: () => void;
 }) {
   const feedback = validation ?? status;
@@ -507,7 +523,8 @@ function RuntimeConfigPanel({
           <span className="block text-[10px] font-bold uppercase tracking-widest text-[#20bd90]">
             Choose your local AI engine
           </span>
-          <span className="mt-1 block text-[10px] uppercase tracking-wider text-white/40">Current session only</span>
+          <span className="mt-1 block text-[10px] uppercase tracking-wider text-white/40">Saved on this device</span>
+          <span className="mt-1 block text-[10px] text-white/35">Local-only. No secrets stored.</span>
         </div>
         <button
           type="button"
@@ -528,7 +545,7 @@ function RuntimeConfigPanel({
         >
           <span className="block text-xs font-bold text-[#e1f5f9]">Use LM Studio Local Default</span>
           <span className="mt-1 block text-[10px] leading-relaxed text-white/45">
-            Fills the current-session settings for the standard local server.
+            Fills local runtime settings for the standard local server.
           </span>
         </button>
 
@@ -584,7 +601,7 @@ function RuntimeConfigPanel({
           onClick={onApply}
           className="rounded-lg border border-[#20bd90]/30 bg-[#20bd90]/10 px-3 py-2 text-[10px] font-bold uppercase tracking-wide text-[#20bd90] transition-colors hover:bg-[#20bd90]/20 disabled:opacity-50"
         >
-          Apply
+          Apply &amp; Save
         </button>
         <button
           type="button"
@@ -593,6 +610,14 @@ function RuntimeConfigPanel({
           className="rounded-lg border border-white/10 bg-black/40 px-3 py-2 text-[10px] font-bold uppercase tracking-wide text-white/50 transition-colors hover:text-white disabled:opacity-50"
         >
           Clear Session Config
+        </button>
+        <button
+          type="button"
+          disabled={busy}
+          onClick={onClearSaved}
+          className="rounded-lg border border-[#fa3205]/30 bg-[#fa3205]/10 px-3 py-2 text-[10px] font-bold uppercase tracking-wide text-[#fa8a76] transition-colors hover:bg-[#fa3205]/20 disabled:opacity-50"
+        >
+          Clear Saved Runtime Config
         </button>
       </div>
 
@@ -635,7 +660,14 @@ function RuntimeConfigField({
 
 function RuntimeConfigFeedback({ status }: { status: RuntimeConfigStatus }) {
   const label = `Local Model: ${status.display_name}`;
-  const source = status.source === 'session' ? 'Session' : status.source === 'environment' ? 'Environment' : 'Missing';
+  const source =
+    status.source === 'session'
+      ? 'Session'
+      : status.source === 'saved'
+        ? 'Saved'
+        : status.source === 'environment'
+          ? 'Environment'
+          : 'Missing';
 
   return (
     <div className="space-y-1">
@@ -645,6 +677,7 @@ function RuntimeConfigFeedback({ status }: { status: RuntimeConfigStatus }) {
         {status.sanitized_endpoint_label ? ` / ${status.sanitized_endpoint_label}` : ''}
       </div>
       {status.detail && <div>{status.detail}</div>}
+      {status.saved_config_problem && <div className="text-[#fa8a76]">{status.saved_config_problem}</div>}
     </div>
   );
 }

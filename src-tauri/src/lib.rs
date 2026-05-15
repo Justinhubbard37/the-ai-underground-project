@@ -1,4 +1,6 @@
-use std::path::PathBuf;
+use std::fs;
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -12,6 +14,8 @@ use uuid::Uuid;
 const LOCAL_GEMMA_TEMPERATURE: f32 = 0.2;
 const LOCAL_GEMMA_DEFAULT_TIMEOUT_SECONDS: u64 = 120;
 const POLL_INTERVAL: Duration = Duration::from_secs(10);
+const RUNTIME_CONFIG_FILE_NAME: &str = "local-runtime-config.json";
+const RUNTIME_CONFIG_SCHEMA_VERSION: u32 = 1;
 
 const VECTOR_SCHEMA_SQL: &str = r#"
 CREATE VIRTUAL TABLE IF NOT EXISTS vector_memory USING vec0(
@@ -87,6 +91,7 @@ struct ActiveModelIdentity {
 #[serde(rename_all = "snake_case")]
 enum RuntimeConfigSource {
     Session,
+    Saved,
     Environment,
     Missing,
 }
@@ -103,6 +108,7 @@ struct RuntimeConfigStatus {
     profile_known: bool,
     sanitized_endpoint_label: Option<String>,
     detail: Option<String>,
+    saved_config_problem: Option<String>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -167,6 +173,9 @@ struct LocalGemmaConfig {
 #[derive(Debug, Default)]
 struct RuntimeConfigState {
     session_config: Mutex<Option<AppliedRuntimeConfig>>,
+    saved_config: Mutex<Option<AppliedRuntimeConfig>>,
+    saved_config_problem: Mutex<Option<String>>,
+    saved_config_path: Mutex<Option<PathBuf>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -182,6 +191,16 @@ struct EffectiveRuntimeConfigValues {
     endpoint: Option<String>,
     model: Option<String>,
     profile_id: Option<String>,
+    saved_config_problem: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+struct PersistedRuntimeConfigFile {
+    schema_version: u32,
+    endpoint: String,
+    model: String,
+    profile_id: String,
+    updated_at: String,
 }
 
 #[derive(Debug, Clone)]
@@ -400,25 +419,55 @@ fn apply_runtime_config(
     runtime_config: State<'_, RuntimeConfigState>,
     payload: RuntimeConfigInput,
 ) -> RuntimeConfigStatus {
-    match runtime_config.session_config.lock() {
-        Ok(mut session_config) => {
-            let status = apply_runtime_config_to_session(&mut session_config, &payload);
-            let valid = status.valid;
-            drop(session_config);
-            if valid {
-                runtime_config_status_from_values(effective_runtime_config_values(&runtime_config))
-            } else {
-                status
-            }
-        }
-        Err(_) => runtime_config_status_from_input(&payload),
+    let status = runtime_config_status_from_input(&payload);
+    if !status.valid {
+        return status;
     }
+
+    let Some(applied) = applied_runtime_config_from_input(&payload) else {
+        return status;
+    };
+
+    if let Err(detail) = save_runtime_config(&runtime_config, &applied) {
+        return runtime_config_status_from_input_with_detail(&payload, &detail);
+    }
+
+    if let Ok(mut session_config) = runtime_config.session_config.lock() {
+        *session_config = Some(applied.clone());
+    }
+    if let Ok(mut saved_config) = runtime_config.saved_config.lock() {
+        *saved_config = Some(applied);
+    }
+    if let Ok(mut saved_config_problem) = runtime_config.saved_config_problem.lock() {
+        *saved_config_problem = None;
+    }
+
+    runtime_config_status_from_values(effective_runtime_config_values(&runtime_config))
 }
 
 #[tauri::command]
 fn clear_runtime_config(runtime_config: State<'_, RuntimeConfigState>) -> RuntimeConfigStatus {
     if let Ok(mut session_config) = runtime_config.session_config.lock() {
         *session_config = None;
+    }
+
+    runtime_config_status_from_values(effective_runtime_config_values(&runtime_config))
+}
+
+#[tauri::command]
+fn clear_saved_runtime_config(
+    runtime_config: State<'_, RuntimeConfigState>,
+) -> RuntimeConfigStatus {
+    let clear_result = clear_saved_runtime_config_file(&runtime_config);
+
+    if let Ok(mut session_config) = runtime_config.session_config.lock() {
+        *session_config = None;
+    }
+    if let Ok(mut saved_config) = runtime_config.saved_config.lock() {
+        *saved_config = None;
+    }
+    if let Ok(mut saved_config_problem) = runtime_config.saved_config_problem.lock() {
+        *saved_config_problem = clear_result.err();
     }
 
     runtime_config_status_from_values(effective_runtime_config_values(&runtime_config))
@@ -431,6 +480,7 @@ pub fn run() {
             if let Err(error) = initialize_vector_database(app.handle()) {
                 eprintln!("SQLite-vec initialization skipped: {error}");
             }
+            initialize_runtime_config_state(app.handle());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -440,7 +490,8 @@ pub fn run() {
             get_runtime_config_status,
             validate_runtime_config,
             apply_runtime_config,
-            clear_runtime_config
+            clear_runtime_config,
+            clear_saved_runtime_config
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -563,6 +614,145 @@ fn optional_env(key: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+fn initialize_runtime_config_state(app: &AppHandle) {
+    let runtime_config = app.state::<RuntimeConfigState>();
+
+    let path = match runtime_config_file_path(app) {
+        Ok(path) => path,
+        Err(error) => {
+            if let Ok(mut problem) = runtime_config.saved_config_problem.lock() {
+                *problem = Some(error);
+            }
+            return;
+        }
+    };
+
+    if let Ok(mut saved_path) = runtime_config.saved_config_path.lock() {
+        *saved_path = Some(path.clone());
+    }
+
+    let (saved_config, saved_problem) = load_saved_runtime_config_from_path(&path);
+    if let Ok(mut state_saved_config) = runtime_config.saved_config.lock() {
+        *state_saved_config = saved_config;
+    }
+    if let Ok(mut state_saved_problem) = runtime_config.saved_config_problem.lock() {
+        *state_saved_problem = saved_problem;
+    };
+}
+
+fn runtime_config_file_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let config_dir = app
+        .path()
+        .app_config_dir()
+        .map_err(|_| "Saved runtime config path is unavailable.".to_string())?;
+
+    Ok(config_dir.join(RUNTIME_CONFIG_FILE_NAME))
+}
+
+fn load_saved_runtime_config_from_path(
+    path: &Path,
+) -> (Option<AppliedRuntimeConfig>, Option<String>) {
+    match fs::read_to_string(path) {
+        Ok(contents) => persisted_runtime_config_from_json(&contents),
+        Err(error) if error.kind() == ErrorKind::NotFound => (None, None),
+        Err(_) => (
+            None,
+            Some("Saved runtime config could not be read.".to_string()),
+        ),
+    }
+}
+
+fn persisted_runtime_config_from_json(
+    contents: &str,
+) -> (Option<AppliedRuntimeConfig>, Option<String>) {
+    let parsed = match serde_json::from_str::<PersistedRuntimeConfigFile>(contents) {
+        Ok(parsed) => parsed,
+        Err(_) => {
+            return (
+                None,
+                Some("Saved runtime config is malformed and was ignored.".to_string()),
+            )
+        }
+    };
+
+    if parsed.schema_version != RUNTIME_CONFIG_SCHEMA_VERSION {
+        return (
+            None,
+            Some("Saved runtime config version is unsupported and was ignored.".to_string()),
+        );
+    }
+
+    let input = RuntimeConfigInput {
+        endpoint: parsed.endpoint,
+        model: parsed.model,
+        profile_id: Some(parsed.profile_id),
+    };
+    let status = runtime_config_status_from_input(&input);
+    if !status.valid {
+        return (
+            None,
+            Some("Saved runtime config is invalid and was ignored.".to_string()),
+        );
+    }
+
+    match applied_runtime_config_from_input(&input) {
+        Some(config) => (Some(config), None),
+        None => (
+            None,
+            Some("Saved runtime config is invalid and was ignored.".to_string()),
+        ),
+    }
+}
+
+fn save_runtime_config(
+    runtime_config: &RuntimeConfigState,
+    config: &AppliedRuntimeConfig,
+) -> Result<(), String> {
+    let path = saved_runtime_config_path(runtime_config)?;
+    save_runtime_config_to_path(&path, config)
+}
+
+fn saved_runtime_config_path(runtime_config: &RuntimeConfigState) -> Result<PathBuf, String> {
+    runtime_config
+        .saved_config_path
+        .lock()
+        .ok()
+        .and_then(|path| path.clone())
+        .ok_or_else(|| "Saved runtime config path is unavailable.".to_string())
+}
+
+fn save_runtime_config_to_path(path: &Path, config: &AppliedRuntimeConfig) -> Result<(), String> {
+    let Some(profile_id) = config.profile_id.clone() else {
+        return Err("Saved runtime config requires a model profile.".to_string());
+    };
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|_| "Could not create saved runtime config directory.".to_string())?;
+    }
+
+    let persisted = PersistedRuntimeConfigFile {
+        schema_version: RUNTIME_CONFIG_SCHEMA_VERSION,
+        endpoint: config.endpoint.clone(),
+        model: config.model.clone(),
+        profile_id,
+        updated_at: Utc::now().to_rfc3339(),
+    };
+    let contents = serde_json::to_string_pretty(&persisted)
+        .map_err(|_| "Could not serialize saved runtime config.".to_string())?;
+
+    fs::write(path, contents).map_err(|_| "Could not write saved runtime config.".to_string())
+}
+
+fn clear_saved_runtime_config_file(runtime_config: &RuntimeConfigState) -> Result<(), String> {
+    let path = saved_runtime_config_path(runtime_config)?;
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(_) => Err("Could not clear saved runtime config.".to_string()),
+    }
+}
+
 fn effective_runtime_config_values(
     runtime_config: &RuntimeConfigState,
 ) -> EffectiveRuntimeConfigValues {
@@ -572,7 +762,17 @@ fn effective_runtime_config_values(
             .lock()
             .ok()
             .and_then(|session_config| session_config.clone()),
+        runtime_config
+            .saved_config
+            .lock()
+            .ok()
+            .and_then(|saved_config| saved_config.clone()),
         environment_runtime_config_values(),
+        runtime_config
+            .saved_config_problem
+            .lock()
+            .ok()
+            .and_then(|problem| problem.clone()),
     )
 }
 
@@ -591,12 +791,15 @@ fn environment_runtime_config_values() -> EffectiveRuntimeConfigValues {
         endpoint,
         model,
         profile_id,
+        saved_config_problem: None,
     }
 }
 
 fn effective_runtime_config_values_from_parts(
     session_config: Option<AppliedRuntimeConfig>,
+    saved_config: Option<AppliedRuntimeConfig>,
     environment_config: EffectiveRuntimeConfigValues,
+    saved_config_problem: Option<String>,
 ) -> EffectiveRuntimeConfigValues {
     match session_config {
         Some(config) => EffectiveRuntimeConfigValues {
@@ -604,8 +807,21 @@ fn effective_runtime_config_values_from_parts(
             endpoint: Some(config.endpoint),
             model: Some(config.model),
             profile_id: config.profile_id,
+            saved_config_problem,
         },
-        None => environment_config,
+        None => match saved_config {
+            Some(config) => EffectiveRuntimeConfigValues {
+                source: RuntimeConfigSource::Saved,
+                endpoint: Some(config.endpoint),
+                model: Some(config.model),
+                profile_id: config.profile_id,
+                saved_config_problem,
+            },
+            None => EffectiveRuntimeConfigValues {
+                saved_config_problem,
+                ..environment_config
+            },
+        },
     }
 }
 
@@ -615,6 +831,7 @@ fn runtime_config_values_from_input(input: &RuntimeConfigInput) -> EffectiveRunt
         endpoint: trimmed_optional(&input.endpoint),
         model: trimmed_optional(&input.model),
         profile_id: input.profile_id.as_deref().and_then(trimmed_optional),
+        saved_config_problem: None,
     }
 }
 
@@ -636,6 +853,7 @@ fn applied_runtime_config_from_input(input: &RuntimeConfigInput) -> Option<Appli
     })
 }
 
+#[cfg(test)]
 fn apply_runtime_config_to_session(
     session_config: &mut Option<AppliedRuntimeConfig>,
     input: &RuntimeConfigInput,
@@ -730,10 +948,21 @@ fn runtime_config_status_from_input(input: &RuntimeConfigInput) -> RuntimeConfig
     runtime_config_status_from_values(runtime_config_values_from_input(input))
 }
 
+fn runtime_config_status_from_input_with_detail(
+    input: &RuntimeConfigInput,
+    detail: &str,
+) -> RuntimeConfigStatus {
+    let mut status = runtime_config_status_from_input(input);
+    status.valid = false;
+    status.detail = Some(detail.to_string());
+    status
+}
+
 fn runtime_config_status_from_values(values: EffectiveRuntimeConfigValues) -> RuntimeConfigStatus {
     let endpoint_configured = values.endpoint.is_some();
     let model_configured = values.model.is_some();
     let sanitized_endpoint_label = sanitized_endpoint_label(values.endpoint.as_deref());
+    let saved_config_problem = values.saved_config_problem.clone();
 
     let Some(endpoint) = values.endpoint else {
         return runtime_config_status(
@@ -746,6 +975,7 @@ fn runtime_config_status_from_values(values: EffectiveRuntimeConfigValues) -> Ru
             false,
             sanitized_endpoint_label,
             "Local runtime endpoint is not configured.",
+            saved_config_problem,
         );
     };
 
@@ -760,6 +990,7 @@ fn runtime_config_status_from_values(values: EffectiveRuntimeConfigValues) -> Ru
             false,
             sanitized_endpoint_label,
             "Model ID is not configured.",
+            saved_config_problem,
         );
     };
 
@@ -774,6 +1005,7 @@ fn runtime_config_status_from_values(values: EffectiveRuntimeConfigValues) -> Ru
             false,
             sanitized_endpoint_label,
             "Endpoint must be localhost and target /v1/chat/completions.",
+            saved_config_problem,
         );
     }
 
@@ -788,6 +1020,7 @@ fn runtime_config_status_from_values(values: EffectiveRuntimeConfigValues) -> Ru
             false,
             sanitized_endpoint_label,
             "Select a local model profile.",
+            saved_config_problem,
         );
     };
 
@@ -803,6 +1036,7 @@ fn runtime_config_status_from_values(values: EffectiveRuntimeConfigValues) -> Ru
             profile_known: true,
             sanitized_endpoint_label,
             detail: None,
+            saved_config_problem,
         },
         Err(_) => runtime_config_status(
             values.source,
@@ -814,6 +1048,7 @@ fn runtime_config_status_from_values(values: EffectiveRuntimeConfigValues) -> Ru
             false,
             sanitized_endpoint_label,
             "Configured local model profile is not recognized.",
+            saved_config_problem,
         ),
     }
 }
@@ -828,6 +1063,7 @@ fn runtime_config_status(
     profile_known: bool,
     sanitized_endpoint_label: Option<String>,
     detail: &str,
+    saved_config_problem: Option<String>,
 ) -> RuntimeConfigStatus {
     RuntimeConfigStatus {
         source,
@@ -840,6 +1076,7 @@ fn runtime_config_status(
         profile_known,
         sanitized_endpoint_label,
         detail: Some(detail.to_string()),
+        saved_config_problem,
     }
 }
 
@@ -1404,6 +1641,7 @@ fn emit_research_update(app: &AppHandle, payload: ResearchUpdate) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn test_values(
         source: RuntimeConfigSource,
@@ -1416,6 +1654,25 @@ mod tests {
             endpoint: endpoint.map(str::to_string),
             model: model.map(str::to_string),
             profile_id: profile_id.map(str::to_string),
+            saved_config_problem: None,
+        }
+    }
+
+    fn test_saved_config_path(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be usable")
+            .as_nanos();
+        std::env::temp_dir()
+            .join(format!("ai-underground-{name}-{nanos}"))
+            .join(RUNTIME_CONFIG_FILE_NAME)
+    }
+
+    fn valid_applied_config(model: &str) -> AppliedRuntimeConfig {
+        AppliedRuntimeConfig {
+            endpoint: "http://127.0.0.1:1234/v1/chat/completions".to_string(),
+            model: model.to_string(),
+            profile_id: Some("gemma4-31b".to_string()),
         }
     }
 
@@ -1711,7 +1968,8 @@ mod tests {
             Some("gemma4-26b-a4b"),
         );
 
-        let effective = effective_runtime_config_values_from_parts(session, environment);
+        let effective =
+            effective_runtime_config_values_from_parts(session, None, environment, None);
 
         assert_eq!(effective.source, RuntimeConfigSource::Session);
         assert_eq!(effective.model, Some("session-model".to_string()));
@@ -1727,7 +1985,7 @@ mod tests {
             Some("gemma4-26b-a4b"),
         );
 
-        let effective = effective_runtime_config_values_from_parts(None, environment);
+        let effective = effective_runtime_config_values_from_parts(None, None, environment, None);
 
         assert_eq!(effective.source, RuntimeConfigSource::Environment);
         assert_eq!(effective.model, Some("environment-model".to_string()));
@@ -1737,12 +1995,209 @@ mod tests {
     fn clear_session_config_returns_to_environment_fallback_or_missing_state() {
         let environment = test_values(RuntimeConfigSource::Missing, None, None, None);
 
-        let effective = effective_runtime_config_values_from_parts(None, environment);
+        let effective = effective_runtime_config_values_from_parts(None, None, environment, None);
         let status = runtime_config_status_from_values(effective);
 
         assert_eq!(status.source, RuntimeConfigSource::Missing);
         assert_eq!(status.status, ActiveModelIdentityStatus::MissingEndpoint);
         assert!(!status.valid);
+    }
+
+    #[test]
+    fn missing_saved_config_falls_back_to_environment_or_missing() {
+        let path = test_saved_config_path("missing");
+        let (saved, problem) = load_saved_runtime_config_from_path(&path);
+        let environment = test_values(RuntimeConfigSource::Missing, None, None, None);
+
+        let effective =
+            effective_runtime_config_values_from_parts(None, saved, environment, problem);
+        let status = runtime_config_status_from_values(effective);
+
+        assert_eq!(status.source, RuntimeConfigSource::Missing);
+        assert_eq!(status.status, ActiveModelIdentityStatus::MissingEndpoint);
+        assert!(status.saved_config_problem.is_none());
+    }
+
+    #[test]
+    fn valid_saved_config_loads() {
+        let path = test_saved_config_path("valid");
+        let config = valid_applied_config("saved-model");
+
+        save_runtime_config_to_path(&path, &config).expect("saved config should write");
+        let (saved, problem) = load_saved_runtime_config_from_path(&path);
+
+        assert_eq!(saved, Some(config));
+        assert!(problem.is_none());
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn session_override_beats_saved_config() {
+        let session = Some(valid_applied_config("session-model"));
+        let saved = Some(valid_applied_config("saved-model"));
+        let environment = test_values(
+            RuntimeConfigSource::Environment,
+            Some("http://localhost:1234/v1/chat/completions"),
+            Some("environment-model"),
+            Some("gemma4-31b"),
+        );
+
+        let effective =
+            effective_runtime_config_values_from_parts(session, saved, environment, None);
+
+        assert_eq!(effective.source, RuntimeConfigSource::Session);
+        assert_eq!(effective.model, Some("session-model".to_string()));
+    }
+
+    #[test]
+    fn clear_session_returns_to_saved_config() {
+        let saved = Some(valid_applied_config("saved-model"));
+        let environment = test_values(RuntimeConfigSource::Missing, None, None, None);
+
+        let effective = effective_runtime_config_values_from_parts(None, saved, environment, None);
+        let status = runtime_config_status_from_values(effective);
+
+        assert_eq!(status.source, RuntimeConfigSource::Saved);
+        assert_eq!(status.status, ActiveModelIdentityStatus::Configured);
+        assert_eq!(status.display_name, "Gemma4-31B Dense");
+    }
+
+    #[test]
+    fn clearing_saved_config_returns_to_environment_or_missing() {
+        let path = test_saved_config_path("clear-saved");
+        let config = valid_applied_config("saved-model");
+        save_runtime_config_to_path(&path, &config).expect("saved config should write");
+
+        fs::remove_file(&path).expect("test should clear saved file");
+        let (saved, problem) = load_saved_runtime_config_from_path(&path);
+        let environment = test_values(RuntimeConfigSource::Missing, None, None, None);
+        let effective =
+            effective_runtime_config_values_from_parts(None, saved, environment, problem);
+        let status = runtime_config_status_from_values(effective);
+
+        assert_eq!(status.source, RuntimeConfigSource::Missing);
+        assert_eq!(status.status, ActiveModelIdentityStatus::MissingEndpoint);
+        assert!(status.saved_config_problem.is_none());
+    }
+
+    #[test]
+    fn invalid_saved_endpoint_is_not_applied() {
+        let persisted = PersistedRuntimeConfigFile {
+            schema_version: RUNTIME_CONFIG_SCHEMA_VERSION,
+            endpoint: "http://example.com/v1/chat/completions".to_string(),
+            model: "google/gemma-4-31b".to_string(),
+            profile_id: "gemma4-31b".to_string(),
+            updated_at: Utc::now().to_rfc3339(),
+        };
+        let contents = serde_json::to_string(&persisted).expect("test json should serialize");
+
+        let (saved, problem) = persisted_runtime_config_from_json(&contents);
+
+        assert!(saved.is_none());
+        assert_eq!(
+            problem,
+            Some("Saved runtime config is invalid and was ignored.".to_string())
+        );
+    }
+
+    #[test]
+    fn malformed_saved_config_is_handled_safely() {
+        let (saved, problem) = persisted_runtime_config_from_json("{");
+
+        assert!(saved.is_none());
+        assert_eq!(
+            problem,
+            Some("Saved runtime config is malformed and was ignored.".to_string())
+        );
+    }
+
+    #[test]
+    fn unsupported_saved_schema_version_is_handled_safely() {
+        let persisted = PersistedRuntimeConfigFile {
+            schema_version: RUNTIME_CONFIG_SCHEMA_VERSION + 1,
+            endpoint: "http://127.0.0.1:1234/v1/chat/completions".to_string(),
+            model: "google/gemma-4-31b".to_string(),
+            profile_id: "gemma4-31b".to_string(),
+            updated_at: Utc::now().to_rfc3339(),
+        };
+        let contents = serde_json::to_string(&persisted).expect("test json should serialize");
+
+        let (saved, problem) = persisted_runtime_config_from_json(&contents);
+
+        assert!(saved.is_none());
+        assert_eq!(
+            problem,
+            Some("Saved runtime config version is unsupported and was ignored.".to_string())
+        );
+    }
+
+    #[test]
+    fn persisted_config_never_bypasses_local_endpoint_validation() {
+        let persisted = PersistedRuntimeConfigFile {
+            schema_version: RUNTIME_CONFIG_SCHEMA_VERSION,
+            endpoint: "http://192.168.1.22:1234/v1/chat/completions".to_string(),
+            model: "google/gemma-4-31b".to_string(),
+            profile_id: "gemma4-31b".to_string(),
+            updated_at: Utc::now().to_rfc3339(),
+        };
+        let contents = serde_json::to_string(&persisted).expect("test json should serialize");
+
+        let (saved, problem) = persisted_runtime_config_from_json(&contents);
+
+        assert!(saved.is_none());
+        assert!(problem.is_some());
+    }
+
+    #[test]
+    fn saved_config_problem_does_not_leak_raw_endpoint() {
+        let raw_endpoint = "http://example.com/v1/chat/completions";
+        let persisted = PersistedRuntimeConfigFile {
+            schema_version: RUNTIME_CONFIG_SCHEMA_VERSION,
+            endpoint: raw_endpoint.to_string(),
+            model: "google/gemma-4-31b".to_string(),
+            profile_id: "gemma4-31b".to_string(),
+            updated_at: Utc::now().to_rfc3339(),
+        };
+        let contents = serde_json::to_string(&persisted).expect("test json should serialize");
+        let (saved, problem) = persisted_runtime_config_from_json(&contents);
+        let environment = test_values(RuntimeConfigSource::Missing, None, None, None);
+
+        let status = runtime_config_status_from_values(effective_runtime_config_values_from_parts(
+            None,
+            saved,
+            environment,
+            problem,
+        ));
+
+        assert!(!status
+            .saved_config_problem
+            .unwrap_or_default()
+            .contains(raw_endpoint));
+    }
+
+    #[test]
+    fn local_gemma_config_can_use_saved_config_values() {
+        let saved = Some(valid_applied_config("saved-model"));
+        let environment = test_values(RuntimeConfigSource::Missing, None, None, None);
+        let effective = effective_runtime_config_values_from_parts(None, saved, environment, None);
+
+        let config = local_gemma_config_from_values(effective).expect("saved config should load");
+
+        assert_eq!(config.model, "saved-model");
+    }
+
+    #[test]
+    fn active_identity_uses_saved_config_when_session_is_absent() {
+        let saved = Some(valid_applied_config("saved-model"));
+        let environment = test_values(RuntimeConfigSource::Missing, None, None, None);
+        let effective = effective_runtime_config_values_from_parts(None, saved, environment, None);
+
+        let identity = active_model_identity_from_values(effective);
+
+        assert_eq!(identity.status, ActiveModelIdentityStatus::Configured);
+        assert_eq!(identity.display_name, "Gemma4-31B Dense");
+        assert_eq!(identity.runtime_model_id, Some("saved-model".to_string()));
     }
 
     #[test]

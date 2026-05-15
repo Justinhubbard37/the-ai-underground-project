@@ -52,3 +52,8 @@ export async function clearRuntimeConfig(): Promise<RuntimeConfigStatus> {
   const response = await invoke<RuntimeConfigStatus>('clear_runtime_config');
   return runtimeConfigStatusSchema.parse(response);
 }
+
+export async function clearSavedRuntimeConfig(): Promise<RuntimeConfigStatus> {
+  const response = await invoke<RuntimeConfigStatus>('clear_saved_runtime_config');
+  return runtimeConfigStatusSchema.parse(response);
+}

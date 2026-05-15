@@ -58,7 +58,7 @@ export interface ActiveModelIdentity {
   detail: string | null;
 }
 
-export type RuntimeConfigSource = 'session' | 'environment' | 'missing';
+export type RuntimeConfigSource = 'session' | 'saved' | 'environment' | 'missing';
 
 export interface RuntimeConfigInput {
   endpoint: string;
@@ -77,6 +77,7 @@ export interface RuntimeConfigStatus {
   profile_known: boolean;
   sanitized_endpoint_label: string | null;
   detail: string | null;
+  saved_config_problem: string | null;
 }
 
 export interface LocalGemmaUpdate {

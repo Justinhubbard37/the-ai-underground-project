@@ -62,7 +62,7 @@ export const runtimeConfigInputSchema = z.object({
 });
 
 export const runtimeConfigStatusSchema = z.object({
-  source: z.enum(['session', 'environment', 'missing']),
+  source: z.enum(['session', 'saved', 'environment', 'missing']),
   valid: z.boolean(),
   status: z.enum([
     'configured',
@@ -79,4 +79,5 @@ export const runtimeConfigStatusSchema = z.object({
   profile_known: z.boolean(),
   sanitized_endpoint_label: z.string().nullable(),
   detail: z.string().nullable(),
+  saved_config_problem: z.string().nullable(),
 });
